@@ -1,0 +1,73 @@
+{
+  "name": "@redoykumardas/snaplink-sdk",
+  "version": "1.0.0",
+  "description": "Private browser automation SDK for Snapchat Web workflows.",
+  "homepage": "https://github.com/redoykumardas/snaplink-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/redoykumardas/snaplink-sdk/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/redoykumardas/snaplink-sdk.git"
+  },
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "packageManager": "npm@10",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "docs",
+    "examples",
+    ".env.example"
+  ],
+  "keywords": [
+    "snaplink",
+    "snapchat",
+    "sdk",
+    "automation",
+    "puppeteer",
+    "browser-automation"
+  ],
+  "directories": {
+    "doc": "docs",
+    "example": "examples",
+    "test": "tests"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {},
+  "type": "module",
+  "scripts": {
+    "check": "find src -name '*.js' -exec node --check {} \\;",
+    "test": "node --test tests/unit/*.test.js",
+    "test:ci": "npm run check && npm test",
+    "test:live": "node tests/live/all-functions.smoke.js",
+    "pack:dry": "npm pack --dry-run",
+    "prepublishOnly": "npm run test:ci && npm run pack:dry",
+    "version:patch": "npm version patch",
+    "version:minor": "npm version minor",
+    "version:major": "npm version major"
+  },
+  "author": "Redoy Kumar Das <redoykumar0@gmail.com>",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "puppeteer": "^24.1.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "license": "ISC"
+}

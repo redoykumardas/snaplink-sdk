@@ -1,0 +1,11 @@
+node_modules/
+.env
+.snapchat-debug/
+**/.snapchat-debug/
+*-cookies.json
+debug-*.png
+captureSnap-error.png
+logout-error.png
+debug-login-fail.png
+*.tgz
+npm-debug.log*
