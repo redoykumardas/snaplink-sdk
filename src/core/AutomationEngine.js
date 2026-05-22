@@ -44,6 +44,10 @@ export class AutomationEngine {
     return launchOptions;
   }
 
+  get page() {
+    return this.bot?.page ?? null;
+  }
+
   requireBot() {
     if (!this.bot || !this.initialized) {
       throw new SnapchatSDKError(

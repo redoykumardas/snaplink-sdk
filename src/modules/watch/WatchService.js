@@ -1,7 +1,7 @@
 import { ErrorCodes, SnapchatSDKError, wrapError } from "../../shared/errors/SnapchatError.js";
 
-const DEFAULT_TRIGGERS = Object.freeze(["received", "new_chat", "new_snap", "unread"]);
-const ALL_TRIGGERS = Object.freeze([...DEFAULT_TRIGGERS, "opened", "new_friend"]);
+const DEFAULT_TRIGGERS = Object.freeze(["new_chat", "new_snap", "opened", "received", "delivered", "say_hi"]);
+const ALL_TRIGGERS = Object.freeze([...DEFAULT_TRIGGERS, "unread", "new_friend"]);
 
 const DEFAULT_WATCH_OPTIONS = Object.freeze({
   limit: 100,

@@ -27,6 +27,9 @@ export default class PrivateSnapchatEngine {
     this.lastRecipientList = [];
     this.messageWatcherBridgeInstalled = false;
     this.messageWatchCallback = null;
+    this.networkCallback = null;
+    this.networkCDPSession = null;
+    this._pendingRequests = null;
     this.options = {
       waitMode: "forever",
       ...options,
@@ -513,6 +516,7 @@ export default class PrivateSnapchatEngine {
 
       const parseActivity = (text) => {
         const lower = text.toLowerCase();
+        if (lower.includes("say hi")) return { statusType: "say_hi", trigger: "say_hi" };
         if (lower.includes("new chat")) return { statusType: "new_chat", trigger: "new_chat" };
         if (lower.includes("new snap")) return { statusType: "new_snap", trigger: "new_snap" };
         if (lower.includes("unread")) return { statusType: "received", trigger: "unread" };
@@ -636,6 +640,77 @@ export default class PrivateSnapchatEngine {
     }).catch(() => { });
 
     console.log("Message watcher stopped");
+  }
+
+  async startWebSocketWatcher(callback) {
+    await this.waitForState("app_ready");
+    this.networkCallback = callback;
+
+    if (!this.page || this.page.isClosed()) return;
+
+    const client = await this.page.createCDPSession();
+    await client.send("Network.enable");
+
+    client.on("Network.requestWillBeSent", (event) => {
+      this._pendingRequests ??= new Map();
+      this._pendingRequests.set(event.requestId, event.request.url);
+    });
+
+    client.on("Network.loadingFinished", async (event) => {
+      if (!this.networkCallback) return;
+      const url = this._pendingRequests?.get(event.requestId);
+      if (!url || (!url.includes("snapchat.com") && !url.includes("snapkit"))) return;
+
+      try {
+        const { body, base64Encoded } = await client.send("Network.getResponseBody", {
+          requestId: event.requestId,
+        });
+        const text = base64Encoded ? Buffer.from(body, "base64").toString("utf-8") : body;
+        const eventData = this.#parseNetworkEvent(text);
+        if (eventData) this.networkCallback(eventData);
+      } catch {}
+    });
+
+    this.networkCDPSession = client;
+    console.log("WebSocket watcher started");
+  }
+
+  async stopWebSocketWatcher() {
+    this.networkCallback = null;
+    if (this.networkCDPSession) {
+      try { await this.networkCDPSession.detach(); } catch {}
+      this.networkCDPSession = null;
+    }
+    this._pendingRequests = null;
+    console.log("WebSocket watcher stopped");
+  }
+
+  #parseNetworkEvent(body) {
+    const lower = body.toLowerCase();
+
+    const PATTERNS = [
+      { keyword: "say hi", type: "say_hi" },
+      { keyword: "new chat", type: "new_chat" },
+      { keyword: "new snap", type: "new_snap" },
+      { keyword: "opened", type: "opened" },
+      { keyword: "received", type: "received" },
+      { keyword: "delivered", type: "delivered" },
+    ];
+
+    for (const { keyword, type } of PATTERNS) {
+      if (lower.includes(keyword)) {
+        return {
+          kind: "websocket_event",
+          source: "network",
+          trigger: type,
+          status: { type, time: null, streak: null },
+          raw: body.slice(0, 500),
+          detectedAt: Date.now(),
+        };
+      }
+    }
+
+    return null;
   }
 
   async waitForSnapPreview(timeout = 15000) {

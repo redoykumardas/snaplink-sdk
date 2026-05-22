@@ -5,6 +5,7 @@ import { ChatService } from "./modules/chat/ChatService.js";
 import { SnapService } from "./modules/snaps/SnapService.js";
 import { StatusService } from "./modules/status/StatusService.js";
 import { WatchService } from "./modules/watch/WatchService.js";
+import { ErrorCodes, SnapchatSDKError } from "./shared/errors/SnapchatError.js";
 
 export class SnapchatClient {
   #engine;
@@ -39,6 +40,8 @@ export class SnapchatClient {
         sendMessage: (friendId, message, options = {}) => this.sendMessage(friendId, message, options),
         getConversation: (friendId) => this.getConversation(friendId),
         watchMessages: (options = {}) => this.watchMessages(options),
+        onEvent: (callback) => this.onEvent(callback),
+        onWebSocketEvent: (callback) => this.onWebSocketEvent(callback),
       },
       snap: {
         sendSnap: (options = {}) => this.sendSnap(options),
@@ -54,6 +57,10 @@ export class SnapchatClient {
     this.messaging = this.api.messaging;
     this.snap = this.api.snap;
     this.browser = this.api.browser;
+  }
+
+  get page() {
+    return this.#engine.page;
   }
 
   init(config = {}) {
@@ -92,12 +99,40 @@ export class SnapchatClient {
     return this.#watcher.watchMessages(options);
   }
 
+  onEvent(callback) {
+    if (typeof callback !== "function") {
+      throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "onEvent() requires a callback function.");
+    }
+
+    return this.#watcher.watchMessages({
+      triggers: ["new_chat", "new_snap", "opened", "received", "delivered", "say_hi"],
+      confirmConversation: false,
+      fallbackPolling: false,
+      onMessage: callback,
+    });
+  }
+
+  async onWebSocketEvent(callback) {
+    if (typeof callback !== "function") {
+      throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "onWebSocketEvent() requires a callback function.");
+    }
+
+    const bot = await this.#engine.getReadyBot();
+    await bot.startWebSocketWatcher(callback);
+
+    return {
+      stop: () => bot.stopWebSocketWatcher(),
+    };
+  }
+
   sendSnap(options = {}) {
     return this.#snaps.sendSnap(options);
   }
 
   async close() {
     await this.#watcher.stop().catch(() => null);
+    const bot = this.#engine.bot;
+    if (bot) await bot.stopWebSocketWatcher().catch(() => null);
     return this.#engine.close();
   }
 }
