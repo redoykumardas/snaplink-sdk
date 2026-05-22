@@ -41,7 +41,6 @@ export class SnapchatClient {
         getConversation: (friendId) => this.getConversation(friendId),
         watchMessages: (options = {}) => this.watchMessages(options),
         onEvent: (callback) => this.onEvent(callback),
-        onWebSocketEvent: (callback) => this.onWebSocketEvent(callback),
       },
       snap: {
         sendSnap: (options = {}) => this.sendSnap(options),
@@ -112,27 +111,12 @@ export class SnapchatClient {
     });
   }
 
-  async onWebSocketEvent(callback) {
-    if (typeof callback !== "function") {
-      throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "onWebSocketEvent() requires a callback function.");
-    }
-
-    const bot = await this.#engine.getReadyBot();
-    await bot.startWebSocketWatcher(callback);
-
-    return {
-      stop: () => bot.stopWebSocketWatcher(),
-    };
-  }
-
   sendSnap(options = {}) {
     return this.#snaps.sendSnap(options);
   }
 
   async close() {
     await this.#watcher.stop().catch(() => null);
-    const bot = this.#engine.bot;
-    if (bot) await bot.stopWebSocketWatcher().catch(() => null);
     return this.#engine.close();
   }
 }
