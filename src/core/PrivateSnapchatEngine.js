@@ -1321,67 +1321,38 @@ export default class PrivateSnapchatEngine {
 
   async sendMessage(obj) {
     await this.waitForState("app_ready");
-    await this.page.waitForSelector(
-      "div.ReactVirtualized__Grid__innerScrollContainer"
-    );
 
-    const lists = await this.page.$$("div[role='listitem']");
-    let found = false;
+    // Open chat if not already open (handles scroll-to-user via cached position)
+    if (!obj.alreadyOpen) {
+      await this.openChat(obj.chat);
+    }
 
-    for (const listItem of lists) {
-      const titleSpan = await listItem.$("span[id^='title-']");
-      if (!titleSpan) continue;
+    // Wait for the chat input box
+    await this.page.waitForSelector('div[role="textbox"]', {
+      visible: true,
+      timeout: 15000
+    });
 
-      const id = await this.page.evaluate((el) => el.id, titleSpan);
-      const chatID = "title-" + obj.chat;
+    const input = await this.page.$('div[role="textbox"]');
+    if (!input) {
+      throw new Error("Message input not found");
+    }
 
-      if (id === chatID) {
-        found = true;
-        console.log("User matched:", obj.chat);
+    await input.focus();
 
-        if (!obj.alreadyOpen) {
-          await titleSpan.click();
-        }
-
-        // wait for chat box (stable)
-        await this.page.waitForSelector('div[role="textbox"]', {
-          visible: true,
-          timeout: 15000
-        });
-
-        const input = await this.page.$('div[role="textbox"]');
-
-        if (!input) {
-          throw new Error("Message input not found");
-        }
-
-        await input.focus();
-
-        if (Array.isArray(obj.message)) {
-          for (let msg of obj.message) {
-            await this.page.keyboard.type(msg);
-            await this.page.keyboard.press("Enter");
-          }
-        }
-
-        if (typeof obj.message === "string" && obj.message !== "") {
-          await this.page.keyboard.type(obj.message);
-          await this.page.keyboard.press("Enter");
-        }
-
-        console.log("✅ Message sent");
-
-        if (obj.exit) {
-          await titleSpan.click();
-        }
-
-        break;
+    if (Array.isArray(obj.message)) {
+      for (let msg of obj.message) {
+        await this.page.keyboard.type(msg);
+        await this.page.keyboard.press("Enter");
       }
     }
 
-    if (!found) {
-      throw new Error(`User not found: ${obj.chat}`);
+    if (typeof obj.message === "string" && obj.message !== "") {
+      await this.page.keyboard.type(obj.message);
+      await this.page.keyboard.press("Enter");
     }
+
+    console.log("✅ Message sent");
   }
 
   async saveCookies(username) {
