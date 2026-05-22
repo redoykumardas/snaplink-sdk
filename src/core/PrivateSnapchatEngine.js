@@ -513,12 +513,12 @@ export default class PrivateSnapchatEngine {
 
       const parseActivity = (text) => {
         const lower = text.toLowerCase();
-        if (lower.includes("new chat")) return { statusType: "Received", trigger: "new_chat" };
-        if (lower.includes("new snap")) return { statusType: "Received", trigger: "new_snap" };
-        if (lower.includes("unread")) return { statusType: "Received", trigger: "unread" };
-        if (lower.includes("received")) return { statusType: "Received", trigger: "received" };
-        if (lower.includes("opened")) return { statusType: "Opened", trigger: "opened" };
-        if (lower.includes("delivered")) return { statusType: "Delivered", trigger: "delivered" };
+        if (lower.includes("new chat")) return { statusType: "new_chat", trigger: "new_chat" };
+        if (lower.includes("new snap")) return { statusType: "new_snap", trigger: "new_snap" };
+        if (lower.includes("unread")) return { statusType: "received", trigger: "unread" };
+        if (lower.includes("received")) return { statusType: "received", trigger: "received" };
+        if (lower.includes("opened")) return { statusType: "opened", trigger: "opened" };
+        if (lower.includes("delivered")) return { statusType: "delivered", trigger: "delivered" };
         return { statusType: null, trigger: null };
       };
 
@@ -1719,11 +1719,20 @@ export default class PrivateSnapchatEngine {
                 !t.includes("\n")
               );
 
+            const fullText = cleanedStatus.join(" ").toLowerCase();
+            const type = fullText.includes("say hi") ? "say_hi"
+              : fullText.includes("new chat") ? "new_chat"
+              : fullText.includes("new snap") ? "new_snap"
+              : fullText.includes("opened") ? "opened"
+              : fullText.includes("received") ? "received"
+              : fullText.includes("delivered") ? "delivered"
+              : null;
+
             return {
               id,
               name,
               status: {
-                type: cleanedStatus.find(t => ["Opened", "Delivered", "Received"].includes(t)) || null,
+                type,
                 time: cleanedStatus.find(t => /\d+\s?[mhdw]/i.test(t)) || null,
                 streak: cleanedStatus.find(t => t.includes("🔥")) || null,
               }

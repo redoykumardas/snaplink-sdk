@@ -4,7 +4,7 @@ export type Friend = {
 };
 
 export type FriendStatus = {
-  type: "Opened" | "Delivered" | "Received" | null;
+  type: "say_hi" | "new_chat" | "new_snap" | "opened" | "received" | "delivered" | null;
   time: string | null;
   streak: string | null;
 };

@@ -61,8 +61,10 @@ function normalizeTriggers(triggers) {
 }
 
 function statusTrigger(statusType) {
-  if (statusType === "Opened") return "opened";
-  if (statusType === "Received") return "received";
+  if (statusType === "opened" || statusType === "Opened") return "opened";
+  if (statusType === "received" || statusType === "Received") return "received";
+  if (statusType === "delivered" || statusType === "Delivered") return "delivered";
+  if (statusType === "say_hi" || statusType === "new_chat" || statusType === "new_snap") return "received";
   return null;
 }
 
@@ -246,7 +248,7 @@ export class WatchService {
       id: rawEvent.friendId,
       name: rawEvent.name ?? "Unknown",
       status: rawEvent.status ?? {
-        type: rawEvent.statusType ?? (trigger === "opened" ? "Opened" : trigger === "new_friend" ? null : "Received"),
+        type: rawEvent.statusType ?? (trigger === "opened" ? "opened" : trigger === "new_friend" ? null : "received"),
         time: null,
         streak: null,
       },
