@@ -697,20 +697,70 @@ export default class PrivateSnapchatEngine {
       { keyword: "delivered", type: "delivered" },
     ];
 
+    let matchType = null;
     for (const { keyword, type } of PATTERNS) {
-      if (lower.includes(keyword)) {
-        return {
-          kind: "websocket_event",
-          source: "network",
-          trigger: type,
-          status: { type, time: null, streak: null },
-          raw: body.slice(0, 500),
-          detectedAt: Date.now(),
-        };
+      if (lower.includes(keyword)) { matchType = type; break; }
+    }
+    if (!matchType) return null;
+
+    const uuidRegex = /[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}/gi;
+    const uuids = [...body.matchAll(uuidRegex)].map(m => m[0]);
+    const friendId = uuids.length > 0 ? uuids[0] : null;
+
+    let name = null;
+    const multiWord = body.match(/[A-ZÀ-Ü][a-zà-ü]+(?:\s[A-ZÀ-Ü][a-zà-ü]+){1,3}/g);
+    if (multiWord) {
+      const skip = new Set([
+        "openedourstorycreatorprofile", "tappedlensprofile",
+        "trendingviralspotlight", "openedourstory",
+        "ourstorycreatorprofile", "ourstory",
+      ]);
+      for (const c of [...new Set(multiWord)]) {
+        const key = c.toLowerCase().replace(/\s/g, "");
+        if (c.length >= 5 && c.length <= 40 && !skip.has(key)) { name = c; break; }
       }
     }
+    if (!name) {
+      const single = body.match(/[A-ZÀ-Ü][a-zà-ü]{3,30}/g);
+      if (single) {
+        const skip = new Set(["Openedourstorycreatorprofile", "Tappedlensprofile", "Trendingviralspotlight"]);
+        for (const s of [...new Set(single)]) {
+          if (s.length >= 4 && !skip.has(s)) { name = s; break; }
+        }
+      }
+    }
+    if (!name) {
+      const fallback = body.match(/(?:^|[^\w])@?([\w.]{4,30})/g);
+      if (fallback) {
+        for (const f of fallback) {
+          const t = f.replace(/^[^\w]+/, "").trim();
+          if (t.length >= 4 && !/^\d+$/.test(t) && !/^[\da-f]{8,}$/i.test(t) && !t.startsWith("http") && !t.startsWith("https")) {
+            name = t.startsWith("@") ? t.slice(1) : t;
+            break;
+          }
+        }
+      }
+    }
+    // Final polish: reject clearly wrong names
+    if (name) {
+      const trash = new Set(["story", "phttps", "laugh", "trend", "reels", "nature", "fear", "wisdom", "titanic", "barbershop"]);
+      if (trash.has(name.toLowerCase().replace(/[\s_]/g, ""))) name = null;
+    }
 
-    return null;
+    const timeMatch = body.match(/\b(\d+\s?[mhdw])\b/i);
+    const time = timeMatch ? timeMatch[0] : null;
+
+    if (!friendId && !name) return null;
+
+    return {
+      kind: "websocket_event",
+      source: "network",
+      trigger: matchType,
+      friendId: friendId || null,
+      name: name || null,
+      status: { type: matchType, time, streak: null },
+      detectedAt: Date.now(),
+    };
   }
 
   async waitForSnapPreview(timeout = 15000) {
@@ -1633,9 +1683,11 @@ export default class PrivateSnapchatEngine {
           currentBlock = { time: "Unknown", conversation: [] };
         }
 
+        let lastSender = "Me";
         item.querySelectorAll("ul.ujRzj > li").forEach(msg => {
           const headerEl = msg.querySelector("header .nonIntl");
-          const sender = headerEl ? headerEl.textContent.trim() : "Me";
+          const sender = headerEl ? headerEl.textContent.trim() : lastSender;
+          lastSender = sender;
 
           msg.querySelectorAll("span.ogn1z").forEach(t => {
             const text = t.textContent.trim();
@@ -1721,8 +1773,8 @@ export default class PrivateSnapchatEngine {
 
     const statuses = new Map();
     let prevSize = 0;
-    let stable = 0;
-    let previousVisibleKey = "";
+    let stallCount = 0;
+    let previousScrollTop = -1;
 
     while (true) {
       const snapshot = await this.page.evaluate(() => {
@@ -1752,35 +1804,70 @@ export default class PrivateSnapchatEngine {
             const listItem = titleSpan.closest("div[role='listitem']");
             const statusContainer = listItem?.querySelector(`#status-${CSS.escape(id)}`);
             const statusParent = statusContainer?.parentElement;
-            const statusTexts = statusParent
+            let statusTexts = statusParent
               ? Array.from(statusParent.querySelectorAll("span")).map(span => span.textContent.trim())
               : [];
+
+            if (!statusTexts.length && listItem) {
+              const allSpans = Array.from(listItem.querySelectorAll("span"));
+              const titleSpan = listItem.querySelector(`span[id^='title-']`);
+              statusTexts = allSpans
+                .filter(s => s !== titleSpan && s.textContent.trim())
+                .map(s => s.textContent.trim());
+            }
 
             const cleanedStatus = statusTexts
               .map(t => t?.trim())
               .filter(t =>
                 t &&
                 t !== "·" &&
-                t.length < 20 &&
+                t.length < 60 &&
                 !t.includes("\n")
               );
 
-            const fullText = cleanedStatus.join(" ").toLowerCase();
-            const type = fullText.includes("say hi") ? "say_hi"
-              : fullText.includes("new chat") ? "new_chat"
-              : fullText.includes("new snap") ? "new_snap"
-              : fullText.includes("opened") ? "opened"
-              : fullText.includes("received") ? "received"
-              : fullText.includes("delivered") ? "delivered"
-              : null;
+            const STATUS_PATTERNS = [
+              { type: "say_hi",   match: /^say\s?hi!?$/i },
+              { type: "say_hi",   match: /^you are now friends$/i },
+              { type: "new_chat", match: /^new chat$/i },
+              { type: "new_chat", match: /group (chat|mention)/i },
+              { type: "new_chat", match: /topic chat/i },
+              { type: "new_snap", match: /^\d+\s*new\s+snaps?$/i },
+              { type: "new_snap", match: /^new\s+(chats?\s+and\s+)?snaps?/i },
+              { type: "new_snap", match: /double-tap to (replay|snap)/i },
+              { type: "new_snap", match: /reacted to your snap/i },
+              { type: "opened",   match: /^opened$/i },
+              { type: "received", match: /^received$/i },
+              { type: "delivered",match: /^delivered$/i },
+            ];
+
+            let matchedType = null;
+            let matchedText = null;
+            for (const span of cleanedStatus) {
+              for (const { type, match } of STATUS_PATTERNS) {
+                if (match.test(span)) {
+                  matchedType = type;
+                  matchedText = span;
+                  break;
+                }
+              }
+              if (matchedType) break;
+            }
+
+            if (!matchedType && cleanedStatus.length > 0) {
+              matchedType = "unknown";
+              matchedText = cleanedStatus[0];
+            }
+
+            const streakStr = statusTexts.find(t => t.includes("🔥")) || null;
 
             return {
               id,
               name,
               status: {
-                type,
-                time: cleanedStatus.find(t => /\d+\s?[mhdw]/i.test(t)) || null,
-                streak: cleanedStatus.find(t => t.includes("🔥")) || null,
+                type: matchedType,
+                text: matchedText,
+                time: cleanedStatus.find(t => /\d+\s?[mhdw]/i.test(t) || /^[a-z]{3}\s+\d{1,2}$/i.test(t) || /^yesterday$/i.test(t)) || null,
+                streak: streakStr,
               }
             };
           })
@@ -1809,70 +1896,56 @@ export default class PrivateSnapchatEngine {
         const findScrollable = () => {
           const title = document.querySelector("div[role='listitem'] span[id^='title-']");
           let node = title?.parentElement;
-
           while (node && node !== document.body) {
             if (node.scrollHeight > node.clientHeight + 10) return node;
             node = node.parentElement;
           }
-
           const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
-          return candidates.find(el =>
-            el.scrollHeight > el.clientHeight + 10 &&
-            el.querySelector("div[role='listitem'] span[id^='title-']")
-          ) || document.scrollingElement;
+          if (candidates.length) {
+            const found = candidates.find(el =>
+              el.scrollHeight > el.clientHeight + 10 &&
+              el.querySelector("div[role='listitem'] span[id^='title-']")
+            );
+            if (found) return found;
+          }
+          const fallback = document.querySelector(".ReactVirtualized__Grid__innerScrollContainer");
+          if (fallback && fallback.scrollHeight > fallback.clientHeight + 10) return fallback;
+          return document.scrollingElement;
         };
 
         const container = findScrollable();
         if (!container) return { moved: false };
 
-        const visibleIds = Array.from(
-          document.querySelectorAll("div[role='listitem'] span[id^='title-']")
-        ).map(el => el.id).join("|");
         const before = container.scrollTop;
-        const amount = Math.max(900, Math.floor(container.clientHeight * 1.35));
+        const amount = Math.max(900, Math.floor(container.clientHeight * 1.5));
         container.scrollBy(0, amount);
         container.dispatchEvent(new Event("scroll", { bubbles: true }));
 
-        const rect = container.getBoundingClientRect();
-        return {
-          moved: container.scrollTop !== before,
-          before,
-          after: container.scrollTop,
-          max: container.scrollHeight - container.clientHeight,
-          visibleIds,
-          x: rect.left + rect.width / 2,
-          y: rect.top + rect.height / 2,
-        };
+        return { moved: container.scrollTop !== before, before, after: container.scrollTop };
       });
 
-      if (Number.isFinite(scrollResult.x) && Number.isFinite(scrollResult.y)) {
-        await this.page.mouse.move(scrollResult.x, scrollResult.y);
-        await this.page.mouse.wheel({ deltaY: 1800 });
+      await delay(800);
+
+      if (statuses.size > prevSize) {
+        stallCount = 0;
+        prevSize = statuses.size;
+        continue;
       }
 
-      await delay(500);
-
-      const reachedEnd = scrollResult.moved && scrollResult.after >= scrollResult.max - 5;
-      const visibleStuck = scrollResult.visibleIds === previousVisibleKey;
-      const sizeStuck = statuses.size === prevSize;
-      const grew = statuses.size > prevSize;
-
-      if (grew) {
-        stable = 0;
-      } else if ((sizeStuck && visibleStuck) || reachedEnd) {
-        stable++;
-      } else {
-        stable = 0;
+      if (scrollResult.moved) {
+        stallCount = 0;
+        prevSize = statuses.size;
+        continue;
       }
 
-      if (stable >= 8) {
+      stallCount++;
+      if (stallCount >= 5) {
         if (targetCount && statuses.size < targetCount) {
           console.warn(`Friend status list stopped at ${statuses.size}/${targetCount}`);
         }
         break;
       }
-      prevSize = statuses.size;
-      previousVisibleKey = scrollResult.visibleIds;
+      await delay(500);
     }
 
     const data = Array.from(statuses.values());
