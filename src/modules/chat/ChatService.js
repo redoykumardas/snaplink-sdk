@@ -1,6 +1,7 @@
 import { ErrorCodes, SnapchatSDKError, wrapError } from "../../shared/errors/SnapchatError.js";
 
 const CACHE_TTL = 10000;
+const UUID_REGEX = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
 
 export class ChatService {
   #chatCache;
@@ -13,14 +14,26 @@ export class ChatService {
     this.#mutex = Promise.resolve();
   }
 
-  async #withLock(fn) {
+  async #withLock(fn, timeoutMs = 0) {
     const prev = this.#mutex;
     let release;
+    let timer;
     this.#mutex = new Promise(resolve => { release = resolve; });
-    await prev;
     try {
+      if (timeoutMs > 0) {
+        await Promise.race([
+          prev,
+          new Promise((_, reject) =>
+            timer = setTimeout(() => reject(new Error(`Mutex timeout after ${timeoutMs}ms`)), timeoutMs)
+          ),
+        ]);
+        clearTimeout(timer);
+      } else {
+        await prev;
+      }
       return await fn();
     } finally {
+      clearTimeout(timer);
       release();
     }
   }
@@ -42,8 +55,31 @@ export class ChatService {
     this.#chatCache.delete(friendId);
   }
 
+  #validateFriendId(friendId) {
+    if (!friendId) return "sendMessage() requires friendId.";
+    if (!UUID_REGEX.test(friendId)) {
+      return `friendId must be a UUID (got "${String(friendId).slice(0, 20)}"). Use getFriends() to obtain friend IDs.`;
+    }
+    return null;
+  }
+
+  #validateMessage(message) {
+    if (!message) return "message is required.";
+    if (Array.isArray(message)) {
+      if (message.length === 0) return "message array must not be empty.";
+      const valid = message.every(m => typeof m === "string" || typeof m === "number");
+      if (!valid) return "each message in the array must be a string or number.";
+      return null;
+    }
+    if (typeof message !== "string" && typeof message !== "number") {
+      return `message must be a string or string[], got ${typeof message}.`;
+    }
+    return null;
+  }
+
   async openChat(friendId) {
-    if (!friendId) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "openChat() requires friendId.");
+    const err = this.#validateFriendId(friendId);
+    if (err) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, err);
 
     try {
       const result = await (await this.engine.getReadyBot()).openChat(friendId);
@@ -55,8 +91,11 @@ export class ChatService {
   }
 
   async sendMessage(friendId, message, options = {}) {
-    if (!friendId) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "sendMessage() requires friendId.");
-    if (!message) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "sendMessage() requires message.");
+    const friendErr = this.#validateFriendId(friendId);
+    if (friendErr) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, friendErr);
+
+    const msgErr = this.#validateMessage(message);
+    if (msgErr) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, msgErr);
 
     return this.#withLock(async () => {
       try {
@@ -81,13 +120,17 @@ export class ChatService {
 
         return result;
       } catch (error) {
+        try {
+          await this.engine.debug?.capture?.("sendMessage-error");
+        } catch {}
         throw wrapError(ErrorCodes.OPERATION_FAILED, `Failed to send message to ${friendId}`, error, { friendId });
       }
-    });
+    }, 60000);
   }
 
   async getConversation(friendId, options = {}) {
-    if (!friendId) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "getConversation() requires friendId.");
+    const friendErr = this.#validateFriendId(friendId);
+    if (friendErr) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, friendErr);
 
     const { timeout = 30000, signal } = options;
 

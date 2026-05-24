@@ -31,6 +31,7 @@ export default class PrivateSnapchatEngine {
     this.networkCallback = null;
     this.networkCDPSession = null;
     this._pendingRequests = null;
+    this._lastSentMap = new Map();
     this.options = {
       waitMode: "forever",
       ...options,
@@ -1225,7 +1226,7 @@ export default class PrivateSnapchatEngine {
 
       if (Number.isFinite(result.x) && Number.isFinite(result.y)) {
         await this.page.mouse.move(result.x, result.y);
-        await this.page.mouse.wheel({ deltaY: 1200 });
+        try { await this.page.mouse.wheel({ deltaY: 1200 }); } catch (e) { /* redundant */ }
       }
 
       if (result.clicked.length || (result.moved && result.visibleKey !== previousVisibleKey)) {
@@ -1420,7 +1421,7 @@ export default class PrivateSnapchatEngine {
 
       if (Number.isFinite(scrollResult.x) && Number.isFinite(scrollResult.y)) {
         await this.page.mouse.move(scrollResult.x, scrollResult.y);
-        await this.page.mouse.wheel({ deltaY: 1800 });
+        try { await this.page.mouse.wheel({ deltaY: 1800 }); } catch (e) { /* redundant wheel, already scrolled */ }
       }
 
       await delay(500);
@@ -1457,10 +1458,12 @@ export default class PrivateSnapchatEngine {
 
   async sendMessage(obj) {
     await this.waitForState("app_ready");
+    const startTime = Date.now();
+    const userId = obj.chat;
 
     // Open chat if not already open (handles scroll-to-user via cached position)
     if (!obj.alreadyOpen) {
-      await this.openChat(obj.chat);
+      await this.openChat(userId);
     }
 
     // Wait for the chat input box
@@ -1469,6 +1472,10 @@ export default class PrivateSnapchatEngine {
       timeout: 15000
     });
 
+    if (this.state !== "app_ready") {
+      throw new Error("Page navigated away during sendMessage");
+    }
+
     const input = await this.page.$('div[role="textbox"]');
     if (!input) {
       throw new Error("Message input not found");
@@ -1476,19 +1483,80 @@ export default class PrivateSnapchatEngine {
 
     await input.focus();
 
-    if (Array.isArray(obj.message)) {
-      for (let msg of obj.message) {
-        await this.page.keyboard.type(msg);
-        await this.page.keyboard.press("Enter");
+    const rawMessages = Array.isArray(obj.message) ? obj.message : [obj.message];
+    const messages = rawMessages.filter(m => String(m).trim().length > 0);
+    let sentCount = 0;
+    let skippedCount = 0;
+
+    for (let i = 0; i < messages.length; i++) {
+      const msgStr = String(messages[i]);
+      const msgKey = `${userId}:${msgStr}`;
+      const lastSent = this._lastSentMap.get(msgKey);
+      if (lastSent && Date.now() - lastSent < 15000) {
+        console.warn(`  skipping duplicate message ${i + 1}/${messages.length} (sent ${Math.round((Date.now() - lastSent) / 1000)}s ago)`);
+        skippedCount++;
+        continue;
+      }
+      const msg = String(messages[i]);
+
+      if (this.state !== "app_ready") {
+        throw new Error(`Page navigated away at message ${i + 1}/${messages.length}`);
+      }
+
+      // Multi-line: use Shift+Enter for line breaks, then Enter to send
+      const lines = msg.split("\n");
+      for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        if (line.length > 200) {
+          // Long text: paste via clipboard to avoid keystroke fragility
+          await this.page.evaluate((text) => {
+            const el = document.querySelector('div[role="textbox"]');
+            if (!el) return;
+            el.focus();
+            document.execCommand("insertText", false, text);
+          }, line);
+        } else {
+          await this.page.keyboard.type(line);
+        }
+        if (li < lines.length - 1) {
+          await this.page.keyboard.down("Shift");
+          await this.page.keyboard.press("Enter");
+          await this.page.keyboard.up("Shift");
+          await delay(200);
+        }
+      }
+
+      await this.page.keyboard.press("Enter");
+      sentCount++;
+
+      // Post-send verification: wait for message to appear in DOM
+      try {
+        const escaped = msg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").slice(0, 50);
+        await this.page.waitForFunction(
+          (uid, text) => {
+            const container = document.querySelector(`#cv-${CSS.escape(uid)}`);
+            if (!container) return false;
+            return Array.from(container.querySelectorAll("div.KB4Aq.SOEIP.IPEgq"))
+              .some(el => el.textContent.includes(text));
+          },
+          { timeout: 5000 },
+          userId, escaped
+        );
+        this._lastSentMap.set(msgKey, Date.now());
+      } catch {
+        console.warn(`sendMessage: message ${i + 1}/${messages.length} not confirmed in DOM`);
+        this._lastSentMap.set(msgKey, Date.now());
+      }
+
+      if (messages.length > 1 && i < messages.length - 1) {
+        console.log(`  sent ${i + 1}/${messages.length}`);
+        await delay(600);
       }
     }
 
-    if (typeof obj.message === "string" && obj.message !== "") {
-      await this.page.keyboard.type(obj.message);
-      await this.page.keyboard.press("Enter");
-    }
-
-    console.log("✅ Message sent");
+    const elapsed = Date.now() - startTime;
+    const skipMsg = skippedCount > 0 ? ` (${skippedCount} skipped as duplicates)` : "";
+    console.log(`✅ ${sentCount} message(s) sent in ${elapsed}ms${skipMsg}`);
   }
 
   async saveCookies(username) {
