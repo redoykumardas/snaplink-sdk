@@ -5,6 +5,7 @@ puppeteer.use(Stealth());
 
 import fs from "fs";
 import fsPromise from "fs/promises";
+import { extractFromDOM } from "../extractors/chatExtractor.js";
 
 function delay(time) {
   return new Promise(function (resolve) {
@@ -113,6 +114,7 @@ export default class PrivateSnapchatEngine {
     const refresh = () => {
       this.refreshState().catch((error) => {
         if (this.isTransientNavigationError(error)) return;
+        console.error("State monitor error:", error.message?.slice(0, 200));
         this.setState("error", error);
       });
     };
@@ -159,7 +161,7 @@ export default class PrivateSnapchatEngine {
 
   setState(state, error = null) {
     if (this.state !== state) {
-      console.log(`SnapchatEngine state: ${this.state} -> ${state}`);
+      console.log(`SnapchatEngine state: ${this.state} -> ${state}${error ? ` (${error.message?.slice(0, 100)})` : ""}`);
     }
 
     this.state = state;
@@ -178,7 +180,7 @@ export default class PrivateSnapchatEngine {
     }
   }
 
-  async waitForState(states) {
+  async waitForState(states, timeoutMs = 0) {
     const wantedStates = Array.isArray(states) ? states : [states];
     const terminalStates = ["blocked", "closed", "error"];
 
@@ -191,6 +193,16 @@ export default class PrivateSnapchatEngine {
     if (wantedStates.includes(this.state)) return this.state;
     if (terminalStates.includes(this.state)) {
       throw new Error(`SnapchatEngine is in ${this.state} state`);
+    }
+
+    if (timeoutMs > 0) {
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`waitForState(${wantedStates.join(",")}) timed out after ${timeoutMs}ms`)), timeoutMs)
+      ).catch(() => {});
+      const waiter = new Promise((resolve, reject) => {
+        this.waiters.push({ states: wantedStates, resolve, reject });
+      });
+      return Promise.race([waiter, timeoutPromise]);
     }
 
     return new Promise((resolve, reject) => {
@@ -1245,7 +1257,6 @@ export default class PrivateSnapchatEngine {
       return;
     }
 
-    await delay(5000);
     await this.browser.close();
     console.log("Snapchat closed");
   }
@@ -1507,14 +1518,27 @@ export default class PrivateSnapchatEngine {
     await this.page.waitForSelector("div[role='listitem']");
 
     const clickVisibleChat = async () => {
-      return await this.page.evaluate((targetId) => {
-        const title = document.querySelector(`#title-${CSS.escape(targetId)}`);
-        if (!title) return false;
+      try {
+        return await this.page.evaluate((targetId) => {
+          const title = document.querySelector(`#title-${CSS.escape(targetId)}`);
+          if (!title) return false;
 
-        title.scrollIntoView({ block: "center" });
-        title.click();
-        return true;
-      }, userId);
+          try {
+            title.scrollIntoView({ block: "nearest" });
+            const rect = title.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) {
+              title.scrollIntoView({ block: "center" });
+            }
+          } catch (e) {
+            title.scrollIntoView({ block: "center" });
+          }
+          title.click();
+          return true;
+        }, userId);
+      } catch (e) {
+        console.log("clickVisibleChat error:", e.message?.slice(0, 150));
+        return false;
+      }
     };
 
     if (await clickVisibleChat()) {
@@ -1526,28 +1550,37 @@ export default class PrivateSnapchatEngine {
       return;
     }
 
+    if (!this.recipientScrollCache.size) {
+      console.log(`recipientScrollCache empty (getFriends() may not have been called), falling back to full list scan for ${userId}`);
+    }
+
     const cachedUser = this.recipientScrollCache.get(userId);
 
-    if (cachedUser) {
-      console.log(`Jumping to cached chat position: ${cachedUser.name}`);
-      await this.page.evaluate((scrollTop) => {
+    if (cachedUser && typeof cachedUser.index === "number") {
+      console.log(`Jumping to cached chat position: ${cachedUser.name} (index ${cachedUser.index})`);
+      await this.page.evaluate((index) => {
         const findScrollable = () => {
-          const candidates = [
-            document.querySelector(".ReactVirtualized__Grid"),
-            document.querySelector("[role='grid']"),
-            document.querySelector(".ReactVirtualized__Grid__innerScrollContainer")?.parentElement,
-            document.scrollingElement,
-          ].filter(Boolean);
-
-          return candidates.find(el => el.scrollHeight > el.clientHeight + 10);
+          const title = document.querySelector("div[role='listitem'] span[id^='title-']");
+          let node = title?.parentElement;
+          while (node && node !== document.body) {
+            if (node.scrollHeight > node.clientHeight + 10) return node;
+            node = node.parentElement;
+          }
+          const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
+          return candidates.find(el =>
+            el.scrollHeight > el.clientHeight + 10 &&
+            el.querySelector("div[role='listitem'] span[id^='title-']")
+          ) || document.scrollingElement;
         };
 
         const container = findScrollable();
         if (!container) return;
 
-        container.scrollTo(0, Math.max(0, scrollTop - 80));
+        const firstItem = document.querySelector("div[role='listitem']");
+        const itemHeight = firstItem ? firstItem.getBoundingClientRect().height : 72;
+        container.scrollTo(0, Math.max(0, index * itemHeight - 100));
         container.dispatchEvent(new Event("scroll", { bubbles: true }));
-      }, cachedUser.scrollTop);
+      }, cachedUser.index);
 
       await delay(500);
 
@@ -1582,7 +1615,6 @@ export default class PrivateSnapchatEngine {
     await delay(500);
 
     let stable = 0;
-    let previousVisibleKey = "";
 
     while (true) {
       const found = await clickVisibleChat();
@@ -1591,59 +1623,43 @@ export default class PrivateSnapchatEngine {
 
       const scrollResult = await this.page.evaluate(() => {
         const findScrollable = () => {
-          const candidates = [
-            document.querySelector(".ReactVirtualized__Grid"),
-            document.querySelector("[role='grid']"),
-            document.querySelector(".ReactVirtualized__Grid__innerScrollContainer")?.parentElement,
-            document.scrollingElement,
-          ].filter(Boolean);
-
-          return candidates.find(el => el.scrollHeight > el.clientHeight + 10);
+          const title = document.querySelector("div[role='listitem'] span[id^='title-']");
+          let node = title?.parentElement;
+          while (node && node !== document.body) {
+            if (node.scrollHeight > node.clientHeight + 10) return node;
+            node = node.parentElement;
+          }
+          const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
+          return candidates.find(el =>
+            el.scrollHeight > el.clientHeight + 10 &&
+            el.querySelector("div[role='listitem'] span[id^='title-']")
+          ) || document.scrollingElement;
         };
 
-        const visibleIds = Array.from(
-          document.querySelectorAll("div[role='listitem'] span[id^='title-']")
-        ).map(el => el.id).join("|");
-
         const container = findScrollable();
-        if (!container) return { moved: false, visibleIds };
+        if (!container) return { moved: false, atEnd: true };
 
         const before = container.scrollTop;
-        const amount = Math.max(700, Math.floor(container.clientHeight * 0.9));
+        const amount = Math.max(900, Math.floor(container.clientHeight * 1.5));
         container.scrollBy(0, amount);
         container.dispatchEvent(new Event("scroll", { bubbles: true }));
 
-        const rect = container.getBoundingClientRect();
-        return {
-          moved: container.scrollTop !== before,
-          before,
-          after: container.scrollTop,
-          max: container.scrollHeight - container.clientHeight,
-          visibleIds,
-          x: rect.left + rect.width / 2,
-          y: rect.top + rect.height / 2,
-        };
+        const after = container.scrollTop;
+        const max = container.scrollHeight - container.clientHeight;
+        return { moved: after !== before, after, max, atEnd: after >= max - 5 };
       });
 
-      if (!scrollResult.moved && Number.isFinite(scrollResult.x) && Number.isFinite(scrollResult.y)) {
-        await this.page.mouse.move(scrollResult.x, scrollResult.y);
-        await this.page.mouse.wheel({ deltaY: 1200 });
-      }
+      await delay(800);
 
-      await delay(350);
-
-      const reachedEnd = scrollResult.moved && scrollResult.after >= scrollResult.max - 5;
-      if (scrollResult.visibleIds === previousVisibleKey || reachedEnd) {
+      if (!scrollResult.moved || scrollResult.atEnd) {
         stable++;
       } else {
         stable = 0;
       }
 
-      if (stable >= 4) {
+      if (stable >= 5) {
         throw new Error("Chat not found: " + userId);
       }
-
-      previousVisibleKey = scrollResult.visibleIds;
     }
 
     // ✅ stable wait
@@ -1654,78 +1670,156 @@ export default class PrivateSnapchatEngine {
 
     console.log("✅ Chat opened:", userId);
   }
-  async extractChatData(userId) {
-    // Shared DOM extractor — returns { name, chat } or null if not ready
-    const extractFromDOM = (userId) => {
-      const container = document.querySelector(`#cv-${userId}`);
-      if (!container) return null;
+  async #waitForChatStability(userId) {
+    await this.page.evaluate(async (uid) => {
+      const container = document.querySelector(`#cv-${CSS.escape(uid)}`);
+      if (!container) return;
 
-      const items = container.querySelectorAll("li.T1yt2");
-      if (!items.length) return null;
+      const sDelay = (ms) => new Promise(r => setTimeout(r, ms));
+      let prevCount = container.querySelectorAll("li.T1yt2").length;
+      let stableCount = 0;
 
-      // Grab the friend's display name from the sidebar
-      const nameEl = document.querySelector(`#title-${userId}`);
-      const name = nameEl ? nameEl.textContent.trim() : "Unknown";
-
-      const chat = [];
-      let currentBlock = null;
-
-      items.forEach((item) => {
-        // Date separator row
-        const timeEl = item.querySelector("time span");
-        if (timeEl) {
-          if (currentBlock) chat.push(currentBlock);
-          currentBlock = { time: timeEl.textContent.trim(), conversation: [] };
-          return;
+      for (let i = 0; i < 10; i++) {
+        await sDelay(500);
+        const currentCount = container.querySelectorAll("li.T1yt2").length;
+        if (currentCount === prevCount) {
+          stableCount++;
+          if (stableCount >= 4) break;
+        } else {
+          stableCount = 0;
+          prevCount = currentCount;
         }
+      }
+    }, userId);
+  }
 
-        if (!currentBlock) {
-          currentBlock = { time: "Unknown", conversation: [] };
-        }
+  async #scrollAndExtract(userId, { timeout = 30000, signal } = {}) {
+    const startTime = Date.now();
 
-        let lastSender = "Me";
-        item.querySelectorAll("ul.ujRzj > li").forEach(msg => {
-          const headerEl = msg.querySelector("header .nonIntl");
-          const sender = headerEl ? headerEl.textContent.trim() : lastSender;
-          lastSender = sender;
+    const msgCount = await this.page.evaluate(async ({ uid, ttl }) => {
+      const container = document.querySelector(`#cv-${CSS.escape(uid)}`);
+      if (!container) return -1;
 
-          msg.querySelectorAll("span.ogn1z").forEach(t => {
-            const text = t.textContent.trim();
-            if (text) currentBlock.conversation.push({ from: sender, text });
-          });
-        });
-      });
+      const countMsgs = () => {
+        let c = 0;
+        const blocks = container.querySelectorAll("li.T1yt2");
+        for (const b of blocks) c += b.querySelectorAll("ul.ujRzj > li").length;
+        if (c === 0) c = container.querySelectorAll("li.T1yt2 > ul > li, li > div.KB4Aq, li > div[id]").length;
+        return c;
+      };
 
-      if (currentBlock && currentBlock.conversation.length > 0) {
-        chat.push(currentBlock);
+      let scrollable = container.parentElement;
+      while (scrollable && scrollable !== document.body) {
+        const cs = window.getComputedStyle(scrollable);
+        if (scrollable.scrollHeight > scrollable.clientHeight + 10 &&
+            (cs.overflowY === "auto" || cs.overflowY === "scroll" || cs.overflow === "auto")) break;
+        scrollable = scrollable.parentElement;
+      }
+      if (!scrollable || scrollable === document.body) {
+        scrollable = container.closest('[style*="overflow"]') || container.parentElement;
       }
 
-      return { id: userId, name, chat };
-    };
+      const sDelay = (ms) => new Promise(r => setTimeout(r, ms));
+      const timeLimit = Date.now() + ttl;
+
+      scrollable.scrollTop = 0;
+      scrollable.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await sDelay(1000);
+
+      let prevCount = countMsgs();
+      let stable = 0;
+      let step = 0;
+
+      while (step < 30) {
+        if (Date.now() > timeLimit) break;
+        step++;
+
+        scrollable.scrollTop += scrollable.clientHeight * 1.5;
+        scrollable.dispatchEvent(new Event("scroll", { bubbles: true }));
+        await sDelay(800);
+
+        const currentCount = countMsgs();
+        if (currentCount > prevCount) {
+          if (step === 1 || step % 5 === 0) {
+            console.log(`scroll step ${step}: ${prevCount} → ${currentCount} msgs`);
+          }
+          stable = 0;
+          prevCount = currentCount;
+        } else {
+          stable++;
+        }
+        if (stable >= 5) {
+          if (step > 1) console.log(`scroll stable at step ${step}, ${prevCount} msgs`);
+          break;
+        }
+      }
+
+      scrollable.scrollTop = scrollable.scrollHeight;
+      scrollable.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await sDelay(1000);
+
+      return countMsgs();
+    }, { uid: userId, ttl: timeout });
+
+    if (signal?.aborted) throw new Error("extractChatData aborted");
+
+    const elapsed = Date.now() - startTime;
+    console.log(`scroll done: ${msgCount >= 0 ? msgCount : "?"} msgs in ${elapsed}ms`);
+
+    return await this.page.evaluate(extractFromDOM, userId);
+  }
+
+  async extractChatData(userId, options = {}) {
+    const { timeout = 30000, signal } = options;
+    const startTime = Date.now();
 
     const attemptExtract = async () => {
       await this.page.waitForFunction(
-        (uid) => !!document.querySelector(`#cv-${uid}`),
+        (uid) => !!document.querySelector(`#cv-${CSS.escape(uid)}`),
         { timeout: 8000 },
         userId
       );
-      await delay(800);
-      return await this.page.evaluate(extractFromDOM, userId);
+
+      await this.#waitForChatStability(userId);
+
+      if (signal?.aborted) throw new Error("extractChatData aborted");
+
+      const result = await this.#scrollAndExtract(userId, { timeout, signal });
+
+      return result;
     };
 
     try {
       const result = await attemptExtract();
       if (!result) throw new Error("Chat container not ready");
+      const elapsed = Date.now() - startTime;
+      const totalMsgs = result.chat.reduce((s, b) => s + (b.conversation?.length || 0), 0);
+      console.log(`extractChatData done: ${result.chat.length} blocks, ${totalMsgs} msgs in ${elapsed}ms`);
       return result;
 
     } catch (err) {
+      if (signal?.aborted) throw new Error("extractChatData aborted");
       console.log("extractChatData failed, retrying...", err.message);
 
+      await delay(2000);
+      if (signal?.aborted) throw new Error("extractChatData aborted");
+      const quickRetry = await this.page.evaluate(extractFromDOM, userId);
+      if (quickRetry) {
+        const elapsed = Date.now() - startTime;
+        console.log(`extractChatData quickRetry done: ${quickRetry.chat.length} blocks in ${elapsed}ms`);
+        return quickRetry;
+      }
+
+      if (signal?.aborted) throw new Error("extractChatData aborted");
       await this.page.reload({ waitUntil: "networkidle2" });
       await delay(2000);
+      if (signal?.aborted) throw new Error("extractChatData aborted");
       await this.handlePopup();
+      if (signal?.aborted) throw new Error("extractChatData aborted");
       await this.openChat(userId);
       await delay(1500);
+
+      if (signal?.aborted) throw new Error("extractChatData aborted");
 
       const retryResult = await this.page.evaluate(extractFromDOM, userId);
       return retryResult ?? { id: userId, name: "Unknown", chat: [] };

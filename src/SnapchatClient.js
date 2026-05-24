@@ -38,7 +38,8 @@ export class SnapchatClient {
       },
       messaging: {
         sendMessage: (friendId, message, options = {}) => this.sendMessage(friendId, message, options),
-        getConversation: (friendId) => this.getConversation(friendId),
+        getConversation: (friendId, options = {}) => this.getConversation(friendId, options),
+        getConversations: (friendIds, options = {}) => this.getConversations(friendIds, options),
         watchMessages: (options = {}) => this.watchMessages(options),
         onEvent: (callback) => this.onEvent(callback),
       },
@@ -90,8 +91,12 @@ export class SnapchatClient {
     return this.#chat.sendMessage(friendId, message, options);
   }
 
-  getConversation(friendId) {
-    return this.#chat.getConversation(friendId);
+  getConversation(friendId, options = {}) {
+    return this.#chat.getConversation(friendId, options);
+  }
+
+  getConversations(friendIds, options = {}) {
+    return this.#chat.getConversations(friendIds, options);
   }
 
   watchMessages(options = {}) {
