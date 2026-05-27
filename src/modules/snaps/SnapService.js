@@ -35,9 +35,15 @@ export class SnapService {
       throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "sendSnap() requires path or imagePath.");
     }
 
+    if (typeof imagePath !== "string" || imagePath.trim().length === 0) {
+      throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "sendSnap() image path must be a non-empty string.");
+    }
+
+    const caption = typeof options.caption === "string" ? options.caption : "";
+
     try {
       const bot = await this.engine.getReadyBot();
-      await bot.captureSnap({ path: imagePath, caption: options.caption });
+      await bot.captureSnap({ path: imagePath, caption, position: options.position });
 
       if (friendRecipients.length) {
         return await bot.sendToFriends(friendRecipients);
@@ -51,7 +57,8 @@ export class SnapService {
         return await bot.send(target);
       }
 
-      return undefined;
+      console.warn("sendSnap: no recipients specified, snap captured but not sent");
+      return;
     } catch (error) {
       throw wrapError(ErrorCodes.OPERATION_FAILED, "Failed to send Snapchat snap", error);
     }

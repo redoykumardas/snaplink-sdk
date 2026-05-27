@@ -256,7 +256,6 @@ export default class PrivateSnapchatEngine {
         "div[role='listitem'] span[id^='title-']",
         "button[aria-label='Camera']",
         "button[data-testid='cameraButton']",
-        "button.qJKfS",
       ].some(selector => isVisible(document.querySelector(selector)));
 
       const isSnapchatWebApp = host === "web.snapchat.com" ||
@@ -472,7 +471,7 @@ export default class PrivateSnapchatEngine {
         console.log("Clicked 'Not now'");
 
         // After dismissing popup, ensure the friend list is loaded again
-        await this.page.waitForSelector('div[role="listitem"], button.qJKfS', { timeout: 15000 });
+        await this.page.waitForSelector('div[role="listitem"], button[data-testid="cameraButton"], button[aria-label="Camera"]', { timeout: 15000 });
         console.log("UI ready after popup");
       }
     } catch (e) {
@@ -796,7 +795,7 @@ export default class PrivateSnapchatEngine {
       }
     }
 
-    const chooserPromise = this.page.waitForFileChooser({ timeout: 3000 }).catch(() => null);
+    const chooserPromise = this.page.waitForFileChooser({ timeout: 15000 }).catch(() => null);
     const clickedUpload = await this.page.evaluate(() => {
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
@@ -845,7 +844,7 @@ export default class PrivateSnapchatEngine {
       const imageBase64 = await fsPromise.readFile(imagePath, "base64");
       const imageData = `data:image/png;base64,${imageBase64}`;
       const replaced = await this.page.evaluate((imgData) => {
-        const previewImg = document.querySelector('#snap-preview-container img.VcjuA, #snap-preview-container img');
+        const previewImg = document.querySelector('#snap-preview-container img');
         if (!previewImg) return false;
         previewImg.src = imgData;
         return true;
@@ -861,15 +860,21 @@ export default class PrivateSnapchatEngine {
     }
   }
 
-  async addSnapCaption(caption) {
+  async addSnapCaption(caption, position) {
     if (!caption) return;
 
     const captionBtnClicked = await this.page.evaluate(() => {
-      const btns = document.querySelectorAll('button');
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const btns = Array.from(document.querySelectorAll('button')).filter(visible);
       for (const btn of btns) {
         const title = btn.getAttribute('title') || '';
         const label = btn.getAttribute('aria-label') || '';
-        if (`${title} ${label}`.toLowerCase().includes('caption')) {
+        const text = btn.textContent?.trim() || '';
+        if (`${title} ${label} ${text}`.toLowerCase().includes('caption')) {
           btn.click();
           return true;
         }
@@ -879,24 +884,38 @@ export default class PrivateSnapchatEngine {
 
     if (!captionBtnClicked) {
       console.warn("Could not find 'Add a caption' button");
+      await this.screenshot({ path: "debug-caption-btn-missing.png" }).catch(() => {});
       return;
     }
 
     console.log("Clicked 'Add a caption' - waiting for input");
     await delay(1500);
 
-    let captionInput = await this.page.$('textarea[aria-label*="Caption input" i], textarea[aria-label*="Caption" i]');
+    let captionInput = await this.page.$('[contenteditable="true"]');
     if (!captionInput) {
-      captionInput = await this.page.$('div[contenteditable="true"]');
+      captionInput = await this.page.$('textarea');
     }
 
-    if (captionInput) {
-      await captionInput.click();
-      await captionInput.type(caption, { delay: 100 });
-      console.log("Caption typed");
-    } else {
+    if (!captionInput) {
       console.warn("Caption input field not found");
       await this.screenshot({ path: "debug-caption-input-missing.png" });
+      return;
+    }
+
+    await captionInput.click();
+    await captionInput.type(caption, { delay: 100 });
+    console.log("Caption typed");
+
+    if (position !== undefined && position !== null) {
+      await delay(500);
+      await captionInput.click();
+      const direction = position < 0 ? 'ArrowUp' : 'ArrowDown';
+      const steps = Math.min(Math.abs(Math.round(position / 15)), 200);
+      for (let i = 0; i < steps; i++) {
+        await this.page.keyboard.press(direction);
+        await delay(30);
+      }
+      console.log(`Caption position adjusted: ${direction} x ${steps}`);
     }
   }
 
@@ -905,36 +924,71 @@ export default class PrivateSnapchatEngine {
     try {
       console.log("Attempting to open camera...");
       const cameraOpened = await this.page.evaluate(() => {
-        const selectors = [
+        const visible = (el) => {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        };
+
+        const attrSelectors = [
           'button[aria-label="Camera"]',
           'button[data-testid="cameraButton"]',
           'button[aria-label="Take a Snap"]',
-          'button.qJKfS',
+          '[role="button"][aria-label="Camera"]',
+          '[role="button"][aria-label*="camera" i]',
+          'a[aria-label*="camera" i]',
         ];
-        for (const sel of selectors) {
-          const btn = document.querySelector(sel);
-          if (btn && btn.getBoundingClientRect().width > 0) {
-            btn.click();
-            return true;
-          }
+        for (const sel of attrSelectors) {
+          const el = document.querySelector(sel);
+          if (el && visible(el)) { el.click(); return true; }
         }
-        const allBtns = document.querySelectorAll('button');
-        for (const btn of allBtns) {
-          const svg = btn.querySelector('svg');
-          if (svg && (svg.innerHTML.includes('M35 45.118') || svg.innerHTML.includes('camera'))) {
-            btn.click();
-            return true;
-          }
+
+        const allCandidates = Array.from(document.querySelectorAll('button, [role="button"], a, div[tabindex]'));
+        for (const el of allCandidates) {
+          if (!visible(el)) continue;
+          const label = (el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "").toLowerCase();
+          if (label.includes("camera")) { el.click(); return true; }
         }
+
+        const bottomCenterBtns = allCandidates.filter(el => {
+          const r = el.getBoundingClientRect();
+          const isBottom = r.y + r.height > window.innerHeight - 120;
+          const isCircle = Math.abs(r.width - r.height) < 15 && r.width > 35 && r.width < 80;
+          const noText = !(el.textContent || "").trim();
+          return isBottom && isCircle && noText;
+        });
+        if (bottomCenterBtns.length) { bottomCenterBtns[0].click(); return true; }
+
+        const sidebarBtns = allCandidates.filter(el => {
+          const r = el.getBoundingClientRect();
+          return r.x < 80 && r.y > 0 && r.width > 0;
+        }).slice(0, 5);
+        const svgBtn = sidebarBtns.find(el => el.querySelector('svg') && !(el.textContent || "").trim());
+        if (svgBtn) { svgBtn.click(); return true; }
+
         return false;
       });
-      if (!cameraOpened) throw new Error("Could not open camera");
+      if (!cameraOpened) {
+        await this.screenshot({ path: "debug-camera-button-missing.png" }).catch(() => {});
+        throw new Error("Could not open camera");
+      }
       console.log("Camera button clicked – waiting for camera UI");
 
-      await delay(1000);
+      await this.page.waitForFunction(
+        () => {
+          const hasInput = document.querySelector('input[type="file"]');
+          const hasLabels = Array.from(document.querySelectorAll('button, label, div'))
+            .some(el => /upload|camera|drag/i.test(el.textContent || ''));
+          const hasVideo = document.querySelector('video#local-video, video');
+          return hasInput || hasLabels || (hasVideo && hasVideo.readyState >= 2 && hasVideo.videoWidth > 0);
+        },
+        { timeout: 15000 }
+      ).catch(() => console.warn("Camera UI wait timed out, proceeding anyway"));
+
+      await delay(500);
 
       if (obj.path && await this.tryUploadSnapImage(obj.path)) {
-        await this.addSnapCaption(obj.caption);
+        await this.addSnapCaption(obj.caption, obj.position);
         console.log("Snap ready on preview screen");
         return;
       }
@@ -945,7 +999,7 @@ export default class PrivateSnapchatEngine {
             const video = document.querySelector('video#local-video, video');
             return video && video.readyState >= 2 && video.videoWidth > 0;
           },
-          { timeout: obj.path ? 5000 : 15000 }
+          { timeout: 15000 }
         );
         console.log("Camera video active");
         await delay(2000);
@@ -993,7 +1047,6 @@ export default class PrivateSnapchatEngine {
         const fallbackSelectors = [
           'button[aria-label="Capture"]',
           'button[data-testid="captureButton"]',
-          'button.FBYjn.gK0xL.A7Cr_.m3ODJ',
         ];
         for (const sel of fallbackSelectors) {
           const btn = await this.page.$(sel);
@@ -1014,7 +1067,7 @@ export default class PrivateSnapchatEngine {
         await this.replacePreviewImage(obj.path);
       }
 
-      await this.addSnapCaption(obj.caption);
+      await this.addSnapCaption(obj.caption, obj.position);
       console.log("Snap ready on preview screen");
     } catch (error) {
       console.error("captureSnap error:", error);
@@ -1027,34 +1080,56 @@ export default class PrivateSnapchatEngine {
     await this.waitForState("app_ready");
     try {
       await this.openSnapSendPanel();
-      let selected = "";
-      person = person.toLowerCase();
-      if (person == "bestfriends") {
-        selected = "ul.UxcmY li  div.Ewflr.cDeBk.A8BRr ";
-      } else if (person == "groups") {
-        selected = "li div.RbA83";
-      } else if (person == "friends") {
-        selected = "li div.Ewflr";
-      } else if (person == "all") {
-        console.log("not implemented yet");
-      } else {
-        throw new Error("Option not found");
-      }
-      const accounts = await this.page.$$(selected);
-      if (!accounts.length) {
+      const audience = person.toLowerCase();
+
+      const clicked = await this.page.evaluate((targetAudience) => {
+        const visible = (el) => {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        };
+        const normalize = (s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+
+        const allSections = Array.from(document.querySelectorAll("section, div[role='region'], [class*='section'], li[role='separator'], h1, h2, h3, h4, h5, h6, span, div"))
+          .filter(el => {
+            const text = el.textContent?.trim() || "";
+            const isSectionHeader = /^(best|my|friend|group)/i.test(text);
+            return isSectionHeader && visible(el);
+          });
+
+        const sectionLabels = {
+          bestfriends: ["best", "bestfriend", "best friend", "bestfriends", "best friends"],
+          groups: ["group", "groups"],
+          friends: ["my friend", "my friends", "friends", "friend", "all friends"],
+        };
+
+        const validLabels = sectionLabels[targetAudience];
+        if (!validLabels) return 0;
+
+        const targetSection = allSections.find(section => {
+          const text = normalize(section.textContent || "");
+          return validLabels.some(label => text.includes(normalize(label)));
+        });
+
+        if (!targetSection) return 0;
+
+        const sectionRoot = targetSection.closest("div, li, section") || targetSection;
+        const items = Array.from(sectionRoot.querySelectorAll('li, [role="listitem"], [role="option"], [role="checkbox"]'))
+          .filter(visible);
+
+        for (const item of items) {
+          const clickTarget = item.querySelector('[role="checkbox"], button, [role="button"], label, input') || item;
+          clickTarget.click();
+        }
+
+        return items.length;
+      }, audience);
+
+      if (clicked === 0) {
         throw new Error(`No snap recipients found for ${person}`);
       }
 
-      for (const account of accounts) {
-        const isFriendVisible = await account.evaluate(
-          (el) => el.offsetWidth > 0 && el.offsetHeight > 0
-        ); // Check if the div is visible
-        if (isFriendVisible) {
-          await account.click(); // Click on the div element
-        } else {
-          console.log("account not found.");
-        }
-      }
+      console.log(`Selected ${clicked} recipient(s) for "${person}"`);
       await this.clickSnapSubmit();
     } catch (error) {
       console.error("Error while sending snap", error);
@@ -1071,7 +1146,6 @@ export default class PrivateSnapchatEngine {
       };
 
       const selectors = [
-        "button.YatIx.fGS78.eKaL7.Bnaur",
         'button[aria-label*="Send" i]',
         'button[title*="Send" i]',
       ];
@@ -1096,7 +1170,15 @@ export default class PrivateSnapchatEngine {
       throw new Error("Snap send panel button not found");
     }
 
-    await delay(1000);
+    await this.page.waitForFunction(
+      () => {
+        const items = document.querySelectorAll('li, [role="listitem"], [role="option"]');
+        return items.length > 0;
+      },
+      { timeout: 10000 }
+    ).catch(() => console.warn("Send panel list items did not appear"));
+
+    await delay(500);
   }
 
   async clickSnapSubmit() {
@@ -1120,23 +1202,32 @@ export default class PrivateSnapchatEngine {
       throw new Error("Snap submit button not found");
     }
 
-    await delay(5000);
+    await delay(2000);
   }
 
   async sendToFriends(recipients) {
     await this.waitForState("app_ready");
     const targets = recipients
       .map((recipient) => {
-        if (typeof recipient === "string") return { id: recipient, name: recipient };
+        if (typeof recipient === "string") return { id: recipient.trim(), name: recipient.trim() };
+        const rawId = recipient?.id ?? recipient?.userId ?? recipient?.username ?? recipient?.name;
+        const rawName = recipient?.name ?? recipient?.displayName ?? recipient?.username ?? recipient?.id;
         return {
-          id: recipient?.id ?? recipient?.userId ?? recipient?.username ?? recipient?.name,
-          name: recipient?.name ?? recipient?.displayName ?? recipient?.username ?? recipient?.id,
+          id: (rawId || "").trim(),
+          name: (rawName || "").trim(),
         };
       })
-      .filter(target => target.id || target.name);
+      .filter(target => target.id.length > 0 || target.name.length > 0);
 
     if (!targets.length) {
       throw new Error("sendToFriends requires at least one friend id or name");
+    }
+
+    for (const target of targets) {
+      if (this.recipientScrollCache.size && target.id && target.name === target.id) {
+        const cached = this.recipientScrollCache.get(target.id);
+        if (cached) target.name = cached.name || cached.displayName || target.id;
+      }
     }
 
     await this.openSnapSendPanel();
@@ -1144,6 +1235,7 @@ export default class PrivateSnapchatEngine {
     const selected = new Set();
     let stable = 0;
     let previousVisibleKey = "";
+    let scrollDownAttempts = 0;
 
     while (selected.size < targets.length) {
       const result = await this.page.evaluate((targetList, selectedKeys) => {
@@ -1158,12 +1250,18 @@ export default class PrivateSnapchatEngine {
           const title = row.querySelector("span[id^='title-'], [id^='title-']");
           const id = title?.id?.replace(/^title-/, "") || "";
           const name = title?.textContent?.trim() || row.textContent?.trim() || "";
-          return { id, name, text: row.textContent || "" };
+          const dataAttr = row.querySelector('[data-user-id], [data-id], [data-friend-id], [data-username]');
+          const dataId = dataAttr?.getAttribute('data-user-id')
+            || dataAttr?.getAttribute('data-id')
+            || dataAttr?.getAttribute('data-friend-id')
+            || "";
+          return { id, dataId, name, text: row.textContent || "", html: row.innerHTML };
         };
 
         const matches = (row, target) => {
           const data = getRowData(row);
           const id = normalize(data.id);
+          const dataId = normalize(data.dataId);
           const name = normalize(data.name);
           const text = normalize(data.text);
           const targetId = normalize(target.id);
@@ -1171,16 +1269,23 @@ export default class PrivateSnapchatEngine {
 
           return Boolean(
             (targetId && id && id === targetId) ||
+            (targetId && dataId && dataId === targetId) ||
             (targetId && text.includes(targetId)) ||
+            (targetId && data.html.includes(target.id)) ||
             (targetName && name && name === targetName) ||
             (targetName && text.includes(targetName))
           );
         };
 
         const findScrollable = () => {
-          const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll'], ul, div"))
-            .filter(el => el.scrollHeight > el.clientHeight + 10);
+          const isScrollable = (el) => {
+            const overflow = window.getComputedStyle(el).overflowY;
+            return (overflow === "scroll" || overflow === "auto") && el.scrollHeight > el.clientHeight + 5;
+          };
+          const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='listbox'], [role='grid'], ul, div"))
+            .filter(el => isScrollable(el) || el.scrollHeight > el.clientHeight + 10);
           return candidates.find(el => /send|friend|best|group/i.test(el.textContent || ""))
+            || candidates.find(el => el.querySelectorAll('li, [role="listitem"]').length > 2)
             || candidates[0]
             || document.scrollingElement;
         };
@@ -1190,13 +1295,13 @@ export default class PrivateSnapchatEngine {
         const clicked = [];
 
         for (const target of targetList) {
-          const key = target.id || target.name;
+          const key = `${target.id || ""}:${target.name || ""}`;
           if (selectedKeys.includes(key)) continue;
 
           const row = rows.find(item => matches(item, target));
           if (!row) continue;
 
-          const clickTarget = row.querySelector('[role="checkbox"], button, div.Ewflr, div.RbA83, label') || row;
+          const clickTarget = row.querySelector('[role="checkbox"], button, [role="button"], label, input') || row;
           clickTarget.click();
           clicked.push(key);
         }
@@ -1206,11 +1311,12 @@ export default class PrivateSnapchatEngine {
         if (!container) return { clicked, moved: false, visibleKey };
 
         const before = container.scrollTop;
+        const rect = container.getBoundingClientRect();
         const amount = Math.max(700, Math.floor(container.clientHeight * 1.2));
-        container.scrollBy(0, amount);
+        const direction = window.__sendingScrollUp ? -1 : 1;
+        container.scrollBy(0, amount * direction);
         container.dispatchEvent(new Event("scroll", { bubbles: true }));
 
-        const rect = container.getBoundingClientRect();
         return {
           clicked,
           moved: container.scrollTop !== before,
@@ -1222,20 +1328,32 @@ export default class PrivateSnapchatEngine {
 
       for (const key of result.clicked) {
         selected.add(key);
+        if (key.includes(":")) {
+          const parts = key.split(":");
+          const keyAlt = parts[0] || parts[1];
+          if (keyAlt && !selected.has(keyAlt)) selected.add(keyAlt);
+        }
       }
 
       if (Number.isFinite(result.x) && Number.isFinite(result.y)) {
         await this.page.mouse.move(result.x, result.y);
-        try { await this.page.mouse.wheel({ deltaY: 1200 }); } catch (e) { /* redundant */ }
       }
 
       if (result.clicked.length || (result.moved && result.visibleKey !== previousVisibleKey)) {
         stable = 0;
+        if (result.moved) scrollDownAttempts++;
       } else {
         stable++;
       }
 
-      if (stable >= 10) break;
+      if (stable >= 3 && scrollDownAttempts > 10 && !window.__sendingScrollUp) {
+        window.__sendingScrollUp = true;
+        stable = 0;
+        scrollDownAttempts = 0;
+        console.log("Switching to scroll-up direction");
+      }
+
+      if (stable >= 5) break;
 
       previousVisibleKey = result.visibleKey;
       await delay(400);
@@ -1243,8 +1361,13 @@ export default class PrivateSnapchatEngine {
 
     if (selected.size < targets.length) {
       const missing = targets
-        .filter(target => !selected.has(target.id || target.name))
+        .filter(target => {
+          const key = `${target.id || ""}:${target.name || ""}`;
+          const keyAlt = target.id || target.name;
+          return !selected.has(key) && !selected.has(keyAlt);
+        })
         .map(target => target.name || target.id);
+      await this.screenshot({ path: "debug-sendToFriends-missing.png" }).catch(() => {});
       throw new Error(`Snap recipients not found: ${missing.join(", ")}`);
     }
 
@@ -2149,56 +2272,106 @@ export default class PrivateSnapchatEngine {
     });
   }
 
-  //select
   async useShortcut(shortcutsArray) {
     await this.waitForState("app_ready");
-    const button = await this.page.$("button.YatIx.fGS78.eKaL7.Bnaur");
-    if (button) {
-      console.log("Send Button found!");
-      await button.click();
-    } else {
-      console.log("Send Button not found.");
+
+    const sendPanelClicked = await this.page.evaluate(() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const selectors = [
+        'button[aria-label*="Send" i]',
+        'button[title*="Send" i]',
+      ];
+      for (const sel of selectors) {
+        const btn = document.querySelector(sel);
+        if (btn && visible(btn)) { btn.click(); return true; }
+      }
+      const btn = Array.from(document.querySelectorAll("button"))
+        .find(b => visible(b) && /send|next/i.test(`${b.textContent} ${b.getAttribute("aria-label") || ""} ${b.getAttribute("title") || ""}`));
+      if (btn) { btn.click(); return true; }
+      return false;
+    });
+
+    if (!sendPanelClicked) {
+      console.warn("Send button not found for shortcuts");
+      return;
     }
+    console.log("Send button clicked for shortcuts");
+
     await delay(2000);
+
     for (const emoji of shortcutsArray) {
-      const clicked = await this.page.$$eval(
-        "div.THeKv button",
-        (buttons, emoji) => {
-          const btn = buttons.find((b) => b.textContent.trim() === emoji);
-          if (btn) {
-            btn.click();
-            //now press the select
-            return true;
-          }
-          return false;
-        },
-        emoji
-      );
+      const clicked = await this.page.evaluate((targetEmoji) => {
+        const visible = (el) => {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        };
+        const btn = Array.from(document.querySelectorAll("button"))
+          .find(b => visible(b) && b.textContent.trim() === targetEmoji);
+        if (!btn) return false;
+        btn.click();
+        return true;
+      }, emoji);
 
       if (clicked) {
-        await this.page.waitForSelector("button.Y7u8A");
-        await this.page.click("button.Y7u8A");
-        const reclick = await this.page.$$eval(
-          "div.THeKv button",
-          (buttons, emoji) => {
-            const btn = buttons.find((b) => b.textContent.trim() === emoji);
-            if (btn) {
-              btn.click();
-              return true;
-            }
-            return false;
-          },
-          emoji
-        );
+        await this.page.evaluate(() => {
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+          };
+          const selectors = [
+            'button[aria-label*="Select" i]',
+            'button[title*="Select" i]',
+          ];
+          for (const sel of selectors) {
+            const btn = document.querySelector(sel);
+            if (btn && visible(btn)) { btn.click(); return true; }
+          }
+          const btn = Array.from(document.querySelectorAll("button"))
+            .find(b => visible(b) && /select|ok|confirm|done/i.test(b.textContent.trim()));
+          if (btn) { btn.click(); return true; }
+          return false;
+        });
+
+        await delay(300);
+        await this.page.evaluate((targetEmoji) => {
+          const btn = Array.from(document.querySelectorAll("button"))
+            .find(b => {
+              const rect = b.getBoundingClientRect();
+              const style = window.getComputedStyle(b);
+              const visible = rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+              return visible && b.textContent.trim() === targetEmoji;
+            });
+          if (btn) { btn.click(); return true; }
+          return false;
+        }, emoji);
       }
+
       if (!clicked) {
         console.warn(`Shortcut "${emoji}" not found.`);
       }
     }
-    //send button
 
-    const sendButton = await this.page.$("button[type='submit']"); 
-    await sendButton.click();
+    const sendButton = await this.page.$("button[type='submit']");
+    if (sendButton) {
+      await sendButton.click();
+    } else {
+      await this.page.evaluate(() => {
+        const btn = Array.from(document.querySelectorAll("button"))
+          .find(b => {
+            const rect = b.getBoundingClientRect();
+            const style = window.getComputedStyle(b);
+            const visible = rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+            return visible && (b.type === "submit" || /^send$/i.test(b.textContent.trim()));
+          });
+        if (btn) btn.click();
+      });
+    }
   }
 
   // add custom methods
