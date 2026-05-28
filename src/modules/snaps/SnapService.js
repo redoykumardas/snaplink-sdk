@@ -19,6 +19,13 @@ function getFriendRecipients(options) {
     .filter(friend => friend?.id || friend?.name);
 }
 
+function formatRecipientsHint(options) {
+  if (options.friendIds?.length) return `friendIds=[${options.friendIds.slice(0, 3).join(",")}${options.friendIds.length > 3 ? "..." : ""}]`;
+  if (options.shortcuts?.length) return `shortcuts=${options.shortcuts.join(",")}`;
+  if (options.target) return `target=${options.target}`;
+  return "no recipients";
+}
+
 export class SnapService {
   constructor(engine) {
     this.engine = engine;
@@ -60,7 +67,11 @@ export class SnapService {
       console.warn("sendSnap: no recipients specified, snap captured but not sent");
       return;
     } catch (error) {
-      throw wrapError(ErrorCodes.OPERATION_FAILED, "Failed to send Snapchat snap", error);
+      const hint = formatRecipientsHint(options);
+      if (error.message?.includes("camera") || error.message?.includes("upload")) {
+        throw wrapError(ErrorCodes.SNAP_CAMERA_ERROR, `Failed to capture/send snap (${hint})`, error);
+      }
+      throw wrapError(ErrorCodes.OPERATION_FAILED, `Failed to send snap (${hint})`, error);
     }
   }
 }

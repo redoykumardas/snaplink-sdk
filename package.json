@@ -1,7 +1,7 @@
 {
   "name": "@redoykumardas/snaplink-sdk",
-  "version": "1.0.0",
-  "description": "Private browser automation SDK for Snapchat Web workflows.",
+  "version": "1.0.1",
+  "description": "Unofficial Node.js SDK for Snapchat Web automation workflows.",
   "homepage": "https://github.com/redoykumardas/snaplink-sdk#readme",
   "bugs": {
     "url": "https://github.com/redoykumardas/snaplink-sdk/issues"
@@ -24,8 +24,6 @@
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
-    "SECURITY.md",
-    "CONTRIBUTING.md",
     "docs",
     "examples",
     ".env.example"
@@ -33,6 +31,7 @@
   "keywords": [
     "snaplink",
     "snapchat",
+    "snapchat-web",
     "sdk",
     "automation",
     "puppeteer",

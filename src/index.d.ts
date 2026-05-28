@@ -3,8 +3,21 @@ export type Friend = {
   name: string;
 };
 
+export type FriendStatusType =
+  | "say_hi"
+  | "new_chat"
+  | "new_snap"
+  | "opened"
+  | "received"
+  | "delivered"
+  | "Opened"
+  | "Received"
+  | "Delivered"
+  | string
+  | null;
+
 export type FriendStatus = {
-  type: "say_hi" | "new_chat" | "new_snap" | "opened" | "received" | "delivered" | null;
+  type: FriendStatusType;
   time: string | null;
   streak: string | null;
 };
@@ -19,6 +32,8 @@ export type MessageWatchTrigger =
   | "new_snap"
   | "unread"
   | "opened"
+  | "delivered"
+  | "say_hi"
   | "new_friend";
 
 export type ConversationMessage = {
@@ -33,6 +48,10 @@ export type ConversationBlock = {
 
 export type Conversation = Friend & {
   chat: ConversationBlock[];
+};
+
+export type ConversationResult = Conversation & {
+  error?: string;
 };
 
 export type Credentials = {
@@ -55,14 +74,46 @@ export type SnapchatClientConfig = {
     warn?: (...args: unknown[]) => void;
     error?: (...args: unknown[]) => void;
   };
+  engineOptions?: Record<string, unknown>;
+  headless?: boolean | string;
+  args?: string[];
+  executablePath?: string;
+  userDataDir?: string;
 };
 
-export type LimitOptions = number | {
-  limit?: number;
-};
+export type LimitOptions =
+  | number
+  | string
+  | {
+      limit?: number;
+      search?: string;
+    };
+
+export type SendMessageValue = string | number | Array<string | number>;
 
 export type SendMessageOptions = {
   exit?: boolean;
+};
+
+export type GetConversationOptions = {
+  timeout?: number;
+  signal?: AbortSignal;
+  maxMessages?: number;
+};
+
+export type GetConversationsProgress = {
+  current: number;
+  total: number;
+  friendId?: string;
+  result?: ConversationResult;
+};
+
+export type GetConversationsOptions = {
+  timeout?: number;
+  signal?: AbortSignal;
+  maxMessages?: number;
+  parallel?: boolean | number;
+  onProgress?: (progress: GetConversationsProgress) => void;
 };
 
 export type SendSnapOptions = {
@@ -75,6 +126,7 @@ export type SendSnapOptions = {
   group?: "bestfriends" | "groups" | "friends" | string;
   recipients?: "bestfriends" | "groups" | "friends" | string | Array<string | Friend>;
   shortcuts?: string[];
+  position?: unknown;
 };
 
 export type MessageWatchEvent = Friend & {
@@ -93,7 +145,7 @@ export type MessageWatchEvent = Friend & {
 };
 
 export type NewFriendEvent = Friend & {
-  source: "poll" | string;
+  source: "dom" | "poll" | string;
   friendId?: string;
   status?: FriendStatus;
   statusText?: string;
@@ -122,9 +174,32 @@ export type WatchMessagesOptions = {
   dedupe?: boolean;
 };
 
+export type EventCallback = (event: MessageWatchEvent) => void | Promise<void>;
+
+export declare const ErrorCodes: {
+  readonly NOT_INITIALIZED: "NOT_INITIALIZED";
+  readonly AUTH_FAILED: "AUTH_FAILED";
+  readonly BROWSER_CLOSED: "BROWSER_CLOSED";
+  readonly CHAT_NOT_FOUND: "CHAT_NOT_FOUND";
+  readonly INVALID_INPUT: "INVALID_INPUT";
+  readonly OPERATION_FAILED: "OPERATION_FAILED";
+  readonly FRIEND_LIST_TIMEOUT: "FRIEND_LIST_TIMEOUT";
+  readonly LOGIN_INPUT_NOT_FOUND: "LOGIN_INPUT_NOT_FOUND";
+  readonly SNAP_CAMERA_ERROR: "SNAP_CAMERA_ERROR";
+  readonly MESSAGE_SEND_FAILED: "MESSAGE_SEND_FAILED";
+  readonly CONVERSATION_TIMEOUT: "CONVERSATION_TIMEOUT";
+  readonly UPLOAD_FAILED: "UPLOAD_FAILED";
+  readonly CAPTCHA_DETECTED: "CAPTCHA_DETECTED";
+  readonly FRIEND_LIST_EMPTY: "FRIEND_LIST_EMPTY";
+};
+
+export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
+
 export declare class SnapchatSDKError extends Error {
-  code: string;
+  name: "SnapchatSDKError";
+  code: ErrorCode | string;
   details?: unknown;
+  cause?: unknown;
 }
 
 export type SnapchatAuthApi = {
@@ -139,9 +214,11 @@ export type SnapchatFriendsApi = {
 };
 
 export type SnapchatMessagingApi = {
-  sendMessage(friendId: string, message: string | string[], options?: SendMessageOptions): Promise<void>;
-  getConversation(friendId: string): Promise<Conversation>;
+  sendMessage(friendId: string, message: SendMessageValue, options?: SendMessageOptions): Promise<void>;
+  getConversation(friendId: string, options?: GetConversationOptions): Promise<Conversation>;
+  getConversations(friendIds: string[], options?: GetConversationsOptions): Promise<Map<string, ConversationResult>>;
   watchMessages(options: WatchMessagesOptions): Promise<MessageWatcherHandle>;
+  onEvent(callback: EventCallback): Promise<MessageWatcherHandle>;
 };
 
 export type SnapchatSnapApi = {
@@ -176,9 +253,11 @@ export declare class SnapchatClient {
   isLoggedIn(): Promise<boolean>;
   getFriends(options?: LimitOptions): Promise<Friend[]>;
   getFriendStatus(options?: LimitOptions): Promise<FriendStatusRecord[]>;
-  sendMessage(friendId: string, message: string | string[], options?: SendMessageOptions): Promise<void>;
-  getConversation(friendId: string): Promise<Conversation>;
+  sendMessage(friendId: string, message: SendMessageValue, options?: SendMessageOptions): Promise<void>;
+  getConversation(friendId: string, options?: GetConversationOptions): Promise<Conversation>;
+  getConversations(friendIds: string[], options?: GetConversationsOptions): Promise<Map<string, ConversationResult>>;
   watchMessages(options: WatchMessagesOptions): Promise<MessageWatcherHandle>;
+  onEvent(callback: EventCallback): Promise<MessageWatcherHandle>;
   sendSnap(options: SendSnapOptions): Promise<void>;
   close(): Promise<void>;
 }

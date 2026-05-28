@@ -2,6 +2,7 @@ import { ErrorCodes, SnapchatSDKError, wrapError } from "../../shared/errors/Sna
 
 const DEFAULT_TRIGGERS = Object.freeze(["new_chat", "new_snap", "opened", "received", "delivered", "say_hi"]);
 const ALL_TRIGGERS = Object.freeze([...DEFAULT_TRIGGERS, "unread", "new_friend"]);
+const MAX_DEDUP_SET_SIZE = 5000;
 
 const DEFAULT_WATCH_OPTIONS = Object.freeze({
   limit: 100,
@@ -202,6 +203,16 @@ export class WatchService {
     }
   }
 
+  #trimSet(set, maxSize = MAX_DEDUP_SET_SIZE) {
+    if (set.size >= maxSize) {
+      const entries = Array.from(set);
+      set.clear();
+      for (const entry of entries.slice(-Math.floor(maxSize / 2))) {
+        set.add(entry);
+      }
+    }
+  }
+
   enqueue(rawEvent) {
     if (!this.running || !rawEvent?.friendId) return;
 
@@ -215,6 +226,7 @@ export class WatchService {
 
     if (this.options?.dedupe && this.eventSeen.has(eventKey)) return;
     this.eventSeen.add(eventKey);
+    this.#trimSet(this.eventSeen);
 
     this.queue.push(rawEvent);
     this.processQueue().catch((error) => this.handleError(error));
@@ -293,6 +305,7 @@ export class WatchService {
 
       if (this.options.dedupe && this.messageSeen.has(event.messageKey)) return;
       this.messageSeen.add(event.messageKey);
+      this.#trimSet(this.messageSeen);
     }
 
     await this.options.onMessage(event);

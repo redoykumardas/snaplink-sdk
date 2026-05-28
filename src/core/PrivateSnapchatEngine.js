@@ -6,6 +6,7 @@ puppeteer.use(Stealth());
 import fs from "fs";
 import fsPromise from "fs/promises";
 import { extractFromDOM } from "../extractors/chatExtractor.js";
+import { ErrorCodes, SnapchatSDKError, wrapError } from "../shared/errors/SnapchatError.js";
 
 function delay(time) {
   return new Promise(function (resolve) {
@@ -350,55 +351,64 @@ export default class PrivateSnapchatEngine {
   async login(credentials) {
     const { username, password } = credentials;
     if (!username || !password) {
-      throw new Error("Credentials cannot be empty");
+      throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "Credentials cannot be empty");
     }
 
     try {
       console.log("Waiting for username form...");
       await this.waitForState("login_ready");
 
-      // Scan for ANY input field dynamically (broader than type="text")
-      await this.page.waitForFunction(
-        () => {
+      // Try standard selectors first, then fall back to dynamic scanning
+      let usernameInput = await this.page.$("#username, #userId, input[name='username'], input[type='email']");
+
+      if (!usernameInput) {
+        await this.page.waitForFunction(
+          () => {
+            const inputs = document.querySelectorAll('input');
+            for (const input of inputs) {
+              const type = input.type?.toLowerCase();
+              if (type === 'text' || type === 'email' || type === 'tel' || !type) {
+                const rect = input.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) return true;
+              }
+            }
+            return false;
+          },
+          { timeout: 15000 }
+        );
+
+        usernameInput = await this.page.evaluateHandle(() => {
           const inputs = document.querySelectorAll('input');
           for (const input of inputs) {
             const type = input.type?.toLowerCase();
-            // Accept text, email, tel, or inputs with no type
             if (type === 'text' || type === 'email' || type === 'tel' || !type) {
-              // Must be visible
               const rect = input.getBoundingClientRect();
-              if (rect.width > 0 && rect.height > 0) {
-                return true;
-              }
+              if (rect.width > 0 && rect.height > 0) return input;
             }
           }
-          return false;
-        },
-        { timeout: 0 }
-      );
+          return null;
+        });
+      }
 
-      // Find the actual input element
-      const usernameInput = await this.page.evaluateHandle(() => {
-        const inputs = document.querySelectorAll('input');
-        for (const input of inputs) {
-          const type = input.type?.toLowerCase();
-          if (type === 'text' || type === 'email' || type === 'tel' || !type) {
-            const rect = input.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) {
-              return input;
-            }
-          }
-        }
-        return null;
-      });
-
-      if (!usernameInput) {
+      if (!usernameInput || (usernameInput.asElement ? !usernameInput.asElement() : false)) {
         await this.page.screenshot({ path: "debug-login-fail.png" });
-        throw new Error("Username input not found");
+
+        // Check if CAPTCHA is blocking
+        const hasCaptcha = await this.page.evaluate(() => {
+          return document.body.textContent.toLowerCase().includes("verify") ||
+                 document.querySelector("iframe[src*='captcha'], iframe[src*='recaptcha']");
+        });
+
+        if (hasCaptcha) {
+          throw new SnapchatSDKError(ErrorCodes.CAPTCHA_DETECTED, "CAPTCHA detected on login page");
+        }
+
+        throw new SnapchatSDKError(ErrorCodes.LOGIN_INPUT_NOT_FOUND, "Username input not found on login page");
       }
 
       console.log("Entering username...");
-      await usernameInput.type(username, { delay: 100 });
+      await usernameInput.click();
+      await this.page.keyboard.type(username, { delay: 15 });
 
       await this.page.keyboard.press("Enter");
       this.setState("authenticating");
@@ -406,15 +416,17 @@ export default class PrivateSnapchatEngine {
       console.log("Navigated to password page, URL:", this.page.url());
 
     } catch (e) {
+      if (e instanceof SnapchatSDKError) throw e;
       console.log("Username field error:", e.message);
-      throw e;
+      throw wrapError(ErrorCodes.LOGIN_INPUT_NOT_FOUND, "Failed to fill username field", e);
     }
 
     // --- Password page ---
     try {
       console.log("Waiting for password field...");
       await this.page.waitForSelector("#password", { visible: true, timeout: 0 });
-      await this.page.type("#password", password, { delay: 100 });
+      await this.page.click("#password");
+      await this.page.keyboard.type(password, { delay: 15 });
       console.log("Password field filled.");
 
       await this.page.keyboard.press("Enter");
@@ -425,7 +437,7 @@ export default class PrivateSnapchatEngine {
 
     } catch (e) {
       console.log("Password field loading error:", e.message);
-      throw e;
+      throw wrapError(ErrorCodes.AUTH_FAILED, "Failed to complete password step", e);
     }
 
     await this.handlePopup();
@@ -783,60 +795,80 @@ export default class PrivateSnapchatEngine {
   }
 
   async tryUploadSnapImage(imagePath) {
-    const existingInput = await this.page.$('input[type="file"]');
-    if (existingInput) {
-      try {
-        await existingInput.uploadFile(imagePath);
-        await this.waitForSnapPreview(15000);
-        console.log("Image uploaded through file input");
+    const tryFileUpload = async (timeout) => {
+      const input = await this.page.$('input[type="file"]');
+      if (!input) return false;
+      await input.uploadFile(imagePath);
+      await this.waitForSnapPreview(timeout);
+      return true;
+    };
+
+    const tryChooserUpload = async (timeout) => {
+      const chooserPromise = this.page.waitForFileChooser({ timeout: 15000 }).catch(() => null);
+      const clicked = await this.page.evaluate(() => {
+        const visible = (el) => {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        };
+
+        const label = (el) => [
+          el.textContent,
+          el.getAttribute("aria-label"),
+          el.getAttribute("title"),
+        ].filter(Boolean).join(" ").toLowerCase();
+
+        const candidates = Array.from(document.querySelectorAll('button, [role="button"], label, div, span'))
+          .filter(el => visible(el) && /upload|drag.*drop|drop.*upload/.test(label(el)))
+          .sort((a, b) => {
+            const ar = a.getBoundingClientRect();
+            const br = b.getBoundingClientRect();
+            return (br.bottom + br.right) - (ar.bottom + ar.right);
+          });
+
+        const target = candidates[0];
+        if (!target) return false;
+        target.click();
         return true;
-      } catch (error) {
-        console.warn("File input upload did not reach preview:", error.message);
+      });
+
+      if (!clicked) return false;
+      const chooser = await chooserPromise;
+      if (!chooser) return false;
+      await chooser.accept([imagePath]);
+      await this.waitForSnapPreview(timeout);
+      return true;
+    };
+
+    // Attempt 1: Direct file input upload
+    const input = await this.page.$('input[type="file"]');
+    if (input) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const ok = await tryFileUpload(attempt === 0 ? 15000 : 30000);
+          if (ok) { console.log("Image uploaded through file input"); return true; }
+        } catch (error) {
+          console.warn(`File input attempt ${attempt + 1} failed:`, error.message);
+        }
       }
     }
 
-    const chooserPromise = this.page.waitForFileChooser({ timeout: 15000 }).catch(() => null);
-    const clickedUpload = await this.page.evaluate(() => {
-      const visible = (el) => {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-      };
-
-      const label = (el) => [
-        el.textContent,
-        el.getAttribute("aria-label"),
-        el.getAttribute("title"),
-      ].filter(Boolean).join(" ").toLowerCase();
-
-      const candidates = Array.from(document.querySelectorAll('button, [role="button"], label, div, span'))
-        .filter(el => visible(el) && /upload|drag.*drop|drop.*upload/.test(label(el)))
-        .sort((a, b) => {
-          const ar = a.getBoundingClientRect();
-          const br = b.getBoundingClientRect();
-          return (br.bottom + br.right) - (ar.bottom + ar.right);
-        });
-
-      const target = candidates[0];
-      if (!target) return false;
-      target.click();
-      return true;
-    });
-
-    if (!clickedUpload) return false;
-
-    try {
-      const chooser = await chooserPromise;
-      if (!chooser) return false;
-
-      await chooser.accept([imagePath]);
-      await this.waitForSnapPreview(15000);
-      console.log("Image uploaded through upload chooser");
-      return true;
-    } catch (error) {
-      console.warn("Upload chooser did not reach preview:", error.message);
-      return false;
+    // Attempt 2: Upload dialog (click upload button, wait for file chooser)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const ok = await tryChooserUpload(attempt === 0 ? 15000 : 30000);
+        if (ok) { console.log("Image uploaded through upload chooser"); return true; }
+      } catch (error) {
+        console.warn(`Upload chooser attempt ${attempt + 1} failed:`, error.message);
+      }
+      await delay(1000);
     }
+
+    // Attempt 3: Fallback — replace preview image directly via DOM
+    console.log("Trying fallback: replace preview image via DOM");
+    await this.replacePreviewImage(imagePath);
+    const previewExists = await this.page.$('#snap-preview-container').catch(() => null);
+    return !!previewExists;
   }
 
   async replacePreviewImage(imagePath) {
@@ -970,7 +1002,7 @@ export default class PrivateSnapchatEngine {
       });
       if (!cameraOpened) {
         await this.screenshot({ path: "debug-camera-button-missing.png" }).catch(() => {});
-        throw new Error("Could not open camera");
+        throw new SnapchatSDKError(ErrorCodes.SNAP_CAMERA_ERROR, "Could not open camera button");
       }
       console.log("Camera button clicked – waiting for camera UI");
 
@@ -1433,150 +1465,172 @@ export default class PrivateSnapchatEngine {
     await requests.click();
   }
 
-  async listRecipients(limit = null) {
+  async listRecipients(limit = null, timeoutMs = 120000) {
     await this.waitForState("app_ready");
     const targetCount = Number.isInteger(limit) && limit > 0 ? limit : null;
     console.log("Waiting for friend list (dynamic)...");
 
-    await this.page.waitForSelector(
-      "div.ReactVirtualized__Grid__innerScrollContainer",
-      { timeout: 60000 }
-    );
+    const ac = new AbortController();
+    const timeout = setTimeout(() => ac.abort(), timeoutMs);
 
-    await this.page.waitForFunction(() => {
-      return document.querySelectorAll("div[role='listitem'] span[id^='title-']").length > 0;
-    }, { timeout: 60000 });
+    try {
+      await this.page.waitForSelector(
+        "div.ReactVirtualized__Grid__innerScrollContainer",
+        { timeout: 30000 }
+      );
 
-    const recipients = new Map();
-    this.recipientScrollCache.clear();
-    this.lastRecipientList = [];
-    let prevSize = 0;
-    let stable = 0;
-    let previousVisibleKey = "";
+      await this.page.waitForFunction(() => {
+        return document.querySelectorAll("div[role='listitem'] span[id^='title-']").length > 0;
+      }, { timeout: 30000 });
 
-    while (true) {
-      const snapshot = await this.page.evaluate(() => {
-        const findScrollable = () => {
-          const title = document.querySelector("div[role='listitem'] span[id^='title-']");
-          let node = title?.parentElement;
+      const recipients = new Map();
+      this.recipientScrollCache.clear();
+      this.lastRecipientList = [];
+      let prevSize = 0;
+      let stable = 0;
+      let previousVisibleKey = "";
 
-          while (node && node !== document.body) {
-            if (node.scrollHeight > node.clientHeight + 10) return node;
-            node = node.parentElement;
-          }
+      while (!ac.signal.aborted) {
+        const snapshot = await this.page.evaluate(() => {
+          const findScrollable = () => {
+            const title = document.querySelector("div[role='listitem'] span[id^='title-']");
+            let node = title?.parentElement;
 
-          const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
-          return candidates.find(el =>
-            el.scrollHeight > el.clientHeight + 10 &&
-            el.querySelector("div[role='listitem'] span[id^='title-']")
-          ) || document.scrollingElement;
-        };
+            while (node && node !== document.body) {
+              if (node.scrollHeight > node.clientHeight + 10) return node;
+              node = node.parentElement;
+            }
 
-        const container = findScrollable();
-        const scrollTop = container?.scrollTop ?? 0;
-        const friends = Array.from(
-          document.querySelectorAll("div[role='listitem'] span[id^='title-']")
-        )
-          .map(el => ({
-            id: el.id.replace("title-", ""),
-            name: el.textContent.trim()
-          }))
-          .filter(user => user.name.toLowerCase() !== "my ai");
-
-        return { friends, scrollTop };
-      });
-
-      for (const user of snapshot.friends) {
-        if (!recipients.has(user.id)) {
-          const cachedUser = {
-            ...user,
-            index: recipients.size,
-            scrollTop: snapshot.scrollTop
+            const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
+            return candidates.find(el =>
+              el.scrollHeight > el.clientHeight + 10 &&
+              el.querySelector("div[role='listitem'] span[id^='title-']")
+            ) || document.scrollingElement;
           };
-          recipients.set(user.id, cachedUser);
-          this.recipientScrollCache.set(user.id, cachedUser);
-        }
-      }
 
-      console.log("Current loaded:", recipients.size);
+          const container = findScrollable();
+          const scrollTop = container?.scrollTop ?? 0;
+          const friends = Array.from(
+            document.querySelectorAll("div[role='listitem'] span[id^='title-']")
+          )
+            .map(el => ({
+              id: el.id.replace("title-", ""),
+              name: el.textContent.trim()
+            }))
+            .filter(user => user.name.toLowerCase() !== "my ai");
 
-      if (targetCount && recipients.size >= targetCount) break;
+          return { friends, scrollTop };
+        });
 
-      const scrollResult = await this.page.evaluate(() => {
-        const findScrollable = () => {
-          const title = document.querySelector("div[role='listitem'] span[id^='title-']");
-          let node = title?.parentElement;
-
-          while (node && node !== document.body) {
-            if (node.scrollHeight > node.clientHeight + 10) return node;
-            node = node.parentElement;
+        for (const user of snapshot.friends) {
+          if (!recipients.has(user.id)) {
+            const cachedUser = {
+              ...user,
+              index: recipients.size,
+              scrollTop: snapshot.scrollTop
+            };
+            recipients.set(user.id, cachedUser);
+            this.recipientScrollCache.set(user.id, cachedUser);
           }
-
-          const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
-          return candidates.find(el =>
-            el.scrollHeight > el.clientHeight + 10 &&
-            el.querySelector("div[role='listitem'] span[id^='title-']")
-          ) || document.scrollingElement;
-        };
-
-        const container = findScrollable();
-        if (!container) return { moved: false };
-
-        const visibleIds = Array.from(
-          document.querySelectorAll("div[role='listitem'] span[id^='title-']")
-        ).map(el => el.id).join("|");
-        const before = container.scrollTop;
-        const amount = Math.max(900, Math.floor(container.clientHeight * 1.35));
-        container.scrollBy(0, amount);
-        container.dispatchEvent(new Event("scroll", { bubbles: true }));
-
-        const rect = container.getBoundingClientRect();
-        return {
-          moved: container.scrollTop !== before,
-          before,
-          after: container.scrollTop,
-          max: container.scrollHeight - container.clientHeight,
-          visibleIds,
-          x: rect.left + rect.width / 2,
-          y: rect.top + rect.height / 2,
-        };
-      });
-
-      if (Number.isFinite(scrollResult.x) && Number.isFinite(scrollResult.y)) {
-        await this.page.mouse.move(scrollResult.x, scrollResult.y);
-        try { await this.page.mouse.wheel({ deltaY: 1800 }); } catch (e) { /* redundant wheel, already scrolled */ }
-      }
-
-      await delay(500);
-
-      const reachedEnd = scrollResult.moved && scrollResult.after >= scrollResult.max - 5;
-      const visibleStuck = scrollResult.visibleIds === previousVisibleKey;
-      const sizeStuck = recipients.size === prevSize;
-      const grew = recipients.size > prevSize;
-
-      if (grew) {
-        stable = 0;
-      } else if ((sizeStuck && visibleStuck) || reachedEnd) {
-        stable++;
-      } else {
-        stable = 0;
-      }
-
-      if (stable >= 8) {
-        if (targetCount && recipients.size < targetCount) {
-          console.warn(`Friend list stopped at ${recipients.size}/${targetCount}`);
         }
-        break;
+
+        console.log("Current loaded:", recipients.size);
+
+        if (targetCount && recipients.size >= targetCount) break;
+
+        const scrollResult = await this.page.evaluate(() => {
+          const findScrollable = () => {
+            const title = document.querySelector("div[role='listitem'] span[id^='title-']");
+            let node = title?.parentElement;
+
+            while (node && node !== document.body) {
+              if (node.scrollHeight > node.clientHeight + 10) return node;
+              node = node.parentElement;
+            }
+
+            const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
+            return candidates.find(el =>
+              el.scrollHeight > el.clientHeight + 10 &&
+              el.querySelector("div[role='listitem'] span[id^='title-']")
+            ) || document.scrollingElement;
+          };
+
+          const container = findScrollable();
+          if (!container) return { moved: false };
+
+          const visibleIds = Array.from(
+            document.querySelectorAll("div[role='listitem'] span[id^='title-']")
+          ).map(el => el.id).join("|");
+          const before = container.scrollTop;
+          const amount = Math.max(900, Math.floor(container.clientHeight * 1.35));
+          container.scrollBy(0, amount);
+          container.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+          const rect = container.getBoundingClientRect();
+          return {
+            moved: container.scrollTop !== before,
+            before,
+            after: container.scrollTop,
+            max: container.scrollHeight - container.clientHeight,
+            visibleIds,
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
+          };
+        });
+
+        if (Number.isFinite(scrollResult.x) && Number.isFinite(scrollResult.y)) {
+          await this.page.mouse.move(scrollResult.x, scrollResult.y);
+          try { await this.page.mouse.wheel({ deltaY: 1800 }); } catch (e) { }
+        }
+
+        await delay(500);
+
+        const reachedEnd = scrollResult.moved && scrollResult.after >= scrollResult.max - 5;
+        const visibleStuck = scrollResult.visibleIds === previousVisibleKey;
+        const sizeStuck = recipients.size === prevSize;
+        const grew = recipients.size > prevSize;
+
+        if (grew) {
+          stable = 0;
+        } else if ((sizeStuck && visibleStuck) || reachedEnd) {
+          stable++;
+        } else {
+          stable = 0;
+        }
+
+        if (stable >= 5) {
+          if (targetCount && recipients.size < targetCount) {
+            console.warn(`Friend list stopped at ${recipients.size}/${targetCount}`);
+          }
+          break;
+        }
+        prevSize = recipients.size;
+        previousVisibleKey = scrollResult.visibleIds;
       }
-      prevSize = recipients.size;
-      previousVisibleKey = scrollResult.visibleIds;
+
+      console.log("Finished loading all friends");
+
+      this.lastRecipientList = Array.from(recipients.values());
+      const data = this.lastRecipientList.map(({ id, name }) => ({ id, name }));
+
+      if (!data.length) {
+        throw new SnapchatSDKError(ErrorCodes.FRIEND_LIST_EMPTY, "No friends found in list");
+      }
+
+      return targetCount ? data.slice(0, targetCount) : data;
+    } catch (error) {
+      if (error instanceof SnapchatSDKError) throw error;
+      if (ac.signal.aborted) {
+        throw new SnapchatSDKError(
+          ErrorCodes.FRIEND_LIST_TIMEOUT,
+          `Friend list loading timed out after ${timeoutMs}ms`,
+          { cause: error }
+        );
+      }
+      throw wrapError(ErrorCodes.OPERATION_FAILED, "Failed to load friend list", error);
+    } finally {
+      clearTimeout(timeout);
     }
-
-    console.log("Finished loading all friends");
-
-    this.lastRecipientList = Array.from(recipients.values());
-    const data = this.lastRecipientList.map(({ id, name }) => ({ id, name }));
-    return targetCount ? data.slice(0, targetCount) : data;
   }
 
   async sendMessage(obj) {
@@ -1884,10 +1938,10 @@ export default class PrivateSnapchatEngine {
     }, userId);
   }
 
-  async #scrollAndExtract(userId, { timeout = 30000, signal } = {}) {
+  async #scrollAndExtract(userId, { timeout = 30000, signal, maxMessages } = {}) {
     const startTime = Date.now();
 
-    const msgCount = await this.page.evaluate(async ({ uid, ttl }) => {
+    const msgCount = await this.page.evaluate(async ({ uid, ttl, maxMsgs }) => {
       const container = document.querySelector(`#cv-${CSS.escape(uid)}`);
       if (!container) return -1;
 
@@ -1943,6 +1997,11 @@ export default class PrivateSnapchatEngine {
           if (step > 1) console.log(`scroll stable at step ${step}, ${prevCount} msgs`);
           break;
         }
+
+        if (maxMsgs && currentCount >= maxMsgs) {
+          console.log(`scroll reached max ${maxMsgs} msgs at step ${step}`);
+          break;
+        }
       }
 
       scrollable.scrollTop = scrollable.scrollHeight;
@@ -1950,7 +2009,7 @@ export default class PrivateSnapchatEngine {
       await sDelay(1000);
 
       return countMsgs();
-    }, { uid: userId, ttl: timeout });
+    }, { uid: userId, ttl: timeout, maxMsgs: maxMessages });
 
     if (signal?.aborted) throw new Error("extractChatData aborted");
 
@@ -1961,7 +2020,7 @@ export default class PrivateSnapchatEngine {
   }
 
   async extractChatData(userId, options = {}) {
-    const { timeout = 30000, signal } = options;
+    const { timeout = 30000, signal, maxMessages } = options;
     const startTime = Date.now();
 
     const attemptExtract = async () => {
@@ -1975,7 +2034,7 @@ export default class PrivateSnapchatEngine {
 
       if (signal?.aborted) throw new Error("extractChatData aborted");
 
-      const result = await this.#scrollAndExtract(userId, { timeout, signal });
+      const result = await this.#scrollAndExtract(userId, { timeout, signal, maxMessages });
 
       return result;
     };

@@ -132,23 +132,20 @@ export class ChatService {
     const friendErr = this.#validateFriendId(friendId);
     if (friendErr) throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, friendErr);
 
-    const { timeout = 30000, signal } = options;
+    const { timeout = 30000, signal, maxMessages } = options;
 
     return this.#withLock(async () => {
-      const cached = this.#getCached(friendId);
-      if (cached) return cached;
+      if (signal?.aborted) throw new Error("Operation aborted");
+
+      if (this.currentChatId !== friendId) {
+        await this.openChat(friendId);
+      }
+
+      if (signal?.aborted) throw new Error("Operation aborted");
 
       try {
-        if (signal?.aborted) throw new Error("Operation aborted");
-
-        if (this.currentChatId !== friendId) {
-          await this.openChat(friendId);
-        }
-
-        if (signal?.aborted) throw new Error("Operation aborted");
-
         const bot = await this.engine.getReadyBot();
-        const result = await bot.extractChatData(friendId, { timeout, signal });
+        const result = await bot.extractChatData(friendId, { timeout, signal, maxMessages });
         this.currentChatId = friendId;
 
         this.#setCache(friendId, result);
@@ -156,7 +153,7 @@ export class ChatService {
         return result;
       } catch (error) {
         if (error.message?.includes("aborted")) throw error;
-        throw wrapError(ErrorCodes.OPERATION_FAILED, `Failed to get conversation for ${friendId}`, error, { friendId });
+        throw wrapError(ErrorCodes.CONVERSATION_TIMEOUT, `Failed to get conversation for ${friendId}`, error, { friendId });
       }
     });
   }
@@ -166,23 +163,56 @@ export class ChatService {
       throw new SnapchatSDKError(ErrorCodes.INVALID_INPUT, "getConversations() requires an array of friendIds.");
     }
 
-    const { timeout = 60000, signal, onProgress } = options;
+    const { timeout = 60000, signal, onProgress, maxMessages, parallel = false } = options;
     const results = new Map();
 
-    for (let i = 0; i < friendIds.length; i++) {
-      if (signal?.aborted) break;
-
-      const friendId = friendIds[i];
-      try {
-        const perTimeout = Math.min(timeout / friendIds.length + 5000, 60000);
-        const result = await this.getConversation(friendId, { timeout: perTimeout, signal });
-        results.set(friendId, result);
-      } catch (error) {
-        results.set(friendId, { id: friendId, name: "Unknown", chat: [], error: error.message });
+    if (parallel) {
+      const concurrency = typeof parallel === "number" ? parallel : 3;
+      const chunks = [];
+      for (let i = 0; i < friendIds.length; i += concurrency) {
+        chunks.push(friendIds.slice(i, i + concurrency));
       }
 
-      if (typeof onProgress === "function") {
-        onProgress({ current: i + 1, total: friendIds.length, friendId, result: results.get(friendId) });
+      for (const chunk of chunks) {
+        if (signal?.aborted) break;
+
+        const entries = await Promise.allSettled(
+          chunk.map(async (friendId) => {
+            const perTimeout = Math.min(timeout / friendIds.length + 5000, 60000);
+            const result = await this.getConversation(friendId, { timeout: perTimeout, signal, maxMessages });
+            return { friendId, result };
+          })
+        );
+
+        for (const entry of entries) {
+          if (entry.status === "fulfilled") {
+            results.set(entry.value.friendId, entry.value.result);
+          } else {
+            const friendId = chunk[entries.indexOf(entry)];
+            results.set(friendId, { id: friendId, name: "Unknown", chat: [], error: entry.reason?.message });
+          }
+        }
+
+        if (typeof onProgress === "function") {
+          onProgress({ current: results.size, total: friendIds.length });
+        }
+      }
+    } else {
+      for (let i = 0; i < friendIds.length; i++) {
+        if (signal?.aborted) break;
+
+        const friendId = friendIds[i];
+        try {
+          const perTimeout = Math.min(timeout / friendIds.length + 5000, 60000);
+          const result = await this.getConversation(friendId, { timeout: perTimeout, signal, maxMessages });
+          results.set(friendId, result);
+        } catch (error) {
+          results.set(friendId, { id: friendId, name: "Unknown", chat: [], error: error.message });
+        }
+
+        if (typeof onProgress === "function") {
+          onProgress({ current: i + 1, total: friendIds.length, friendId, result: results.get(friendId) });
+        }
       }
     }
 
