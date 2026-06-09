@@ -93,6 +93,8 @@ export default class PrivateSnapchatEngine {
         timeout: 0
       });
 
+      await this.handleCookieConsent();
+
       const readyState = await this.waitForState(["login_ready", "app_ready"]);
       console.log(`Snapchat ready state: ${readyState}, URL: ${this.page.url()}`);
       return readyState;
@@ -348,6 +350,62 @@ export default class PrivateSnapchatEngine {
       message.includes("Protocol error") && message.includes("Runtime.callFunctionOn");
   }
 
+  async handleCookieConsent() {
+    try {
+      const dismissed = await this.page.evaluate(() => {
+        const visible = (el) => {
+          if (!el) return false;
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        };
+
+        const btnText = (el) => [
+          el.textContent?.trim() || "",
+          el.getAttribute("aria-label") || "",
+          el.getAttribute("title") || "",
+        ].join(" ").toLowerCase();
+
+        const allBtns = Array.from(document.querySelectorAll("button, [role='button'], a"));
+        const cookieBtn = allBtns.find(btn => {
+          if (!visible(btn)) return false;
+          const text = btnText(btn);
+          return text.includes("accept all") || text.includes("allow all") || text.includes("accept cookies");
+        });
+
+        if (cookieBtn) { cookieBtn.click(); return true; }
+
+        const cookieBannerSelectors = [
+          "div[class*='cookie']", "div[id*='cookie']", 
+          "div[class*='consent']", "div[id*='consent']",
+          "div[class*='gdpr']", "div[id*='gdpr']",
+          "#onetrust-banner-sdk", "#cookie-law-info-bar",
+        ];
+
+        for (const sel of cookieBannerSelectors) {
+          const banner = document.querySelector(sel);
+          if (banner && visible(banner)) {
+            const acceptBtn = Array.from(banner.querySelectorAll("button, a, span, div"))
+              .find(el => {
+                const text = btnText(el);
+                return text.includes("accept all") || text.includes("allow all") || text.includes("accept cookies") || text.includes("i agree");
+              });
+            if (acceptBtn) { acceptBtn.click(); return true; }
+          }
+        }
+
+        return false;
+      });
+
+      if (dismissed) {
+        console.log("Cookie consent popup accepted");
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    } catch (e) {
+      console.log("Cookie consent handling skipped:", e.message?.slice(0, 100));
+    }
+  }
+
   async login(credentials) {
     const { username, password } = credentials;
     if (!username || !password) {
@@ -357,6 +415,7 @@ export default class PrivateSnapchatEngine {
     try {
       console.log("Waiting for username form...");
       await this.waitForState("login_ready");
+      await this.handleCookieConsent();
 
       // Try standard selectors first, then fall back to dynamic scanning
       let usernameInput = await this.page.$("#username, #userId, input[name='username'], input[type='email']");
@@ -421,22 +480,43 @@ export default class PrivateSnapchatEngine {
       throw wrapError(ErrorCodes.LOGIN_INPUT_NOT_FOUND, "Failed to fill username field", e);
     }
 
-    // --- Password page ---
+    // --- Password page or Verification Challenge ---
     try {
-      console.log("Waiting for password field...");
-      await this.page.waitForSelector("#password", { visible: true, timeout: 0 });
-      await this.page.click("#password");
-      await this.page.keyboard.type(password, { delay: 15 });
-      console.log("Password field filled.");
+      console.log("Waiting for password field or verification...");
+      const passResult = await this.page.waitForSelector("#password", { visible: true, timeout: 10000 }).catch(() => null);
 
-      await this.page.keyboard.press("Enter");
-      this.setState("authenticating");
+      if (passResult) {
+        await this.page.click("#password");
+        await this.page.keyboard.type(password, { delay: 15 });
+        console.log("Password field filled.");
 
-      await this.waitForState("app_ready");
-      console.log("Login complete, URL:", this.page.url());
+        await this.page.keyboard.press("Enter");
+        this.setState("authenticating");
 
+        await this.waitForState("app_ready");
+        console.log("Login complete, URL:", this.page.url());
+      } else {
+        const isVerification = await this.page.evaluate(() => {
+          const text = document.body?.innerText?.toLowerCase() || "";
+          return text.includes("confirm it") || text.includes("confirm it's you") || text.includes("verify your identity");
+        });
+
+        if (isVerification) {
+          await this.page.screenshot({ path: "debug-verification-prompt.png" });
+          console.log("⚠️ Snapchat sent a verification challenge ('Confirm It's You')");
+          console.log("📸 Screenshot saved: debug-verification-prompt.png");
+          console.log("🔓 Waiting up to 120s for you to complete verification in the browser...");
+
+          await this.waitForState("app_ready");
+          console.log("Login complete after verification, URL:", this.page.url());
+        } else {
+          throw new SnapchatSDKError(ErrorCodes.AUTH_FAILED, "Password field not found and no verification challenge detected");
+        }
+      }
     } catch (e) {
-      console.log("Password field loading error:", e.message);
+      if (e instanceof SnapchatSDKError) throw e;
+      console.log("Password/verification error:", e.message);
+      await this.page.screenshot({ path: "debug-password-step-error.png" }).catch(() => {});
       throw wrapError(ErrorCodes.AUTH_FAILED, "Failed to complete password step", e);
     }
 
