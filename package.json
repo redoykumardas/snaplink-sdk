@@ -1,6 +1,6 @@
 {
   "name": "@redoykumardas/snaplink-sdk",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Unofficial Node.js SDK for Snapchat Web automation workflows.",
   "homepage": "https://github.com/redoykumardas/snaplink-sdk#readme",
   "bugs": {
