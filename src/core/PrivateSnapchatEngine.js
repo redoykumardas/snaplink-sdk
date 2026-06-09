@@ -2200,109 +2200,84 @@ export default class PrivateSnapchatEngine {
     let stallCount = 0;
     let previousScrollTop = -1;
 
-    while (true) {
-      const snapshot = await this.page.evaluate(() => {
-        const findScrollable = () => {
-          const title = document.querySelector("div[role='listitem'] span[id^='title-']");
-          let node = title?.parentElement;
+    const extractStatuses = () => this.page.evaluate(() => {
+      const findScrollable = () => {
+        const title = document.querySelector("div[role='listitem'] span[id^='title-']");
+        let node = title?.parentElement;
 
-          while (node && node !== document.body) {
-            if (node.scrollHeight > node.clientHeight + 10) return node;
-            node = node.parentElement;
+        while (node && node !== document.body) {
+          if (node.scrollHeight > node.clientHeight + 10) return node;
+          node = node.parentElement;
+        }
+
+        const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
+        return candidates.find(el =>
+          el.scrollHeight > el.clientHeight + 10 &&
+          el.querySelector("div[role='listitem'] span[id^='title-']")
+        ) || document.scrollingElement;
+      };
+
+      const container = findScrollable();
+      const scrollTop = container?.scrollTop ?? 0;
+
+      const users = Array.from(document.querySelectorAll("div[role='listitem'] span[id^='title-']"))
+        .map(titleSpan => {
+          const id = titleSpan.id.replace(/^title-/, "");
+          const name = titleSpan.textContent.trim();
+          const listItem = titleSpan.closest("div[role='listitem']");
+
+          const fullText = (listItem?.innerText || "").trim().toLowerCase();
+
+          const STATUS_PATTERNS = [
+            { type: "say_hi",   match: /say\s?hi/i },
+            { type: "say_hi",   match: /you are now friends/i },
+            { type: "new_chat", match: /new chat/i },
+            { type: "new_chat", match: /group (chat|mention)/i },
+            { type: "new_chat", match: /topic chat/i },
+            { type: "new_snap", match: /new snap/i },
+            { type: "new_snap", match: /double-tap to (replay|snap)/i },
+            { type: "new_snap", match: /reacted to your snap/i },
+            { type: "opened",   match: /^opened$/m },
+            { type: "received", match: /^received$/m },
+            { type: "delivered",match: /^delivered$/m },
+          ];
+
+          let matchedType = null;
+          for (const { type, match } of STATUS_PATTERNS) {
+            if (match.test(fullText)) {
+              matchedType = type;
+              break;
+            }
           }
 
-          const candidates = Array.from(document.querySelectorAll(".ReactVirtualized__Grid, [role='grid'], [class*='scroll']"));
-          return candidates.find(el =>
-            el.scrollHeight > el.clientHeight + 10 &&
-            el.querySelector("div[role='listitem'] span[id^='title-']")
-          ) || document.scrollingElement;
-        };
+          const timeMatch = fullText.match(/\b(\d+\s?[mhdw])\b/i);
+          const dateMatch = fullText.match(/\b([a-z]{3}\s+\d{1,2})\b/i);
+          const yesterdayMatch = fullText.match(/\byesterday\b/i);
+          const time = timeMatch ? timeMatch[1] : dateMatch ? dateMatch[1] : yesterdayMatch ? "yesterday" : null;
+          const streakStr = fullText.includes("🔥") ? "🔥" : null;
 
-        const container = findScrollable();
-        const scrollTop = container?.scrollTop ?? 0;
-
-        const users = Array.from(document.querySelectorAll("div[role='listitem'] span[id^='title-']"))
-          .map(titleSpan => {
-            const id = titleSpan.id.replace(/^title-/, "");
-            const name = titleSpan.textContent.trim();
-            const listItem = titleSpan.closest("div[role='listitem']");
-            const statusContainer = listItem?.querySelector(`#status-${CSS.escape(id)}`);
-            const statusParent = statusContainer?.parentElement;
-            let statusTexts = statusParent
-              ? Array.from(statusParent.querySelectorAll("span")).map(span => span.textContent.trim())
-              : [];
-
-            if (!statusTexts.length && listItem) {
-              const allSpans = Array.from(listItem.querySelectorAll("span"));
-              const titleSpan = listItem.querySelector(`span[id^='title-']`);
-              statusTexts = allSpans
-                .filter(s => s !== titleSpan && s.textContent.trim())
-                .map(s => s.textContent.trim());
+          return {
+            id,
+            name,
+            status: {
+              type: matchedType || "unknown",
+              text: matchedType || null,
+              time,
+              streak: streakStr,
             }
+          };
+        })
+        .filter(user => user.name && user.name.toLowerCase() !== "my ai");
 
-            const cleanedStatus = statusTexts
-              .map(t => t?.trim())
-              .filter(t =>
-                t &&
-                t !== "·" &&
-                t.length < 60 &&
-                !t.includes("\n")
-              );
+      return { users, scrollTop };
+    });
 
-            const STATUS_PATTERNS = [
-              { type: "say_hi",   match: /^say\s?hi!?$/i },
-              { type: "say_hi",   match: /^you are now friends$/i },
-              { type: "new_chat", match: /^new chat$/i },
-              { type: "new_chat", match: /group (chat|mention)/i },
-              { type: "new_chat", match: /topic chat/i },
-              { type: "new_snap", match: /^\d+\s*new\s+snaps?$/i },
-              { type: "new_snap", match: /^new\s+(chats?\s+and\s+)?snaps?/i },
-              { type: "new_snap", match: /double-tap to (replay|snap)/i },
-              { type: "new_snap", match: /reacted to your snap/i },
-              { type: "opened",   match: /^opened$/i },
-              { type: "received", match: /^received$/i },
-              { type: "delivered",match: /^delivered$/i },
-            ];
-
-            let matchedType = null;
-            let matchedText = null;
-            for (const span of cleanedStatus) {
-              for (const { type, match } of STATUS_PATTERNS) {
-                if (match.test(span)) {
-                  matchedType = type;
-                  matchedText = span;
-                  break;
-                }
-              }
-              if (matchedType) break;
-            }
-
-            if (!matchedType && cleanedStatus.length > 0) {
-              matchedType = "unknown";
-              matchedText = cleanedStatus[0];
-            }
-
-            const streakStr = statusTexts.find(t => t.includes("🔥")) || null;
-
-            return {
-              id,
-              name,
-              status: {
-                type: matchedType,
-                text: matchedText,
-                time: cleanedStatus.find(t => /\d+\s?[mhdw]/i.test(t) || /^[a-z]{3}\s+\d{1,2}$/i.test(t) || /^yesterday$/i.test(t)) || null,
-                streak: streakStr,
-              }
-            };
-          })
-          .filter(user => user.name && user.name.toLowerCase() !== "my ai");
-
-        return { users, scrollTop };
-      });
+    while (true) {
+      const snapshot = await extractStatuses();
 
       for (const user of snapshot.users) {
-        if (!statuses.has(user.id)) {
-          statuses.set(user.id, user);
+        statuses.set(user.id, user);
+        if (!this.recipientScrollCache.has(user.id)) {
           this.recipientScrollCache.set(user.id, {
             id: user.id,
             name: user.name,
@@ -2312,7 +2287,7 @@ export default class PrivateSnapchatEngine {
         }
       }
 
-      console.log("Current status loaded:", statuses.size);
+      console.log("Current loaded:", statuses.size);
 
       if (targetCount && statuses.size >= targetCount) break;
 
@@ -2370,6 +2345,24 @@ export default class PrivateSnapchatEngine {
         break;
       }
       await delay(500);
+    }
+
+    // Stabilization: scroll to top, wait for sync, re-read all visible statuses
+    console.log(`Scroll complete (${statuses.size} friends), syncing statuses...`);
+    await this.page.evaluate(() => {
+      const container = document.querySelector(".ReactVirtualized__Grid, [role='grid']") || document.scrollingElement;
+      if (container) {
+        container.scrollTo(0, 0);
+        container.dispatchEvent(new Event("scroll", { bubbles: true }));
+      }
+    });
+    await delay(3000);
+
+    const finalSnapshot = await extractStatuses();
+    for (const user of finalSnapshot.users) {
+      if (statuses.has(user.id)) {
+        statuses.set(user.id, user);
+      }
     }
 
     const data = Array.from(statuses.values());
